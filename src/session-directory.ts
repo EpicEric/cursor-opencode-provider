@@ -18,6 +18,7 @@
  */
 
 import path from "node:path"
+import { trace } from "./debug.js"
 
 const MAX_TRACKED_SESSIONS = 256
 
@@ -71,9 +72,9 @@ export function resolveSessionWorkspaceRoot(input: {
   workspaceRoot?: string
   cwd?: string
 }): string {
-  return path.resolve(
-    opencodeDirectoryHeader(input.headers) ??
-      getSessionDirectory(input.sessionKey) ??
-      (input.workspaceRoot || input.cwd || process.cwd()),
-  )
+  const resolved = opencodeDirectoryHeader(input.headers) ?? getSessionDirectory(input.sessionKey)
+  if (resolved) return path.resolve(resolved)
+  const fallback = input.workspaceRoot || input.cwd || process.cwd()
+  trace(`session directory: no header or session mark sessionKey=${input.sessionKey ?? "-"}; fallback=${fallback}`)
+  return path.resolve(fallback)
 }

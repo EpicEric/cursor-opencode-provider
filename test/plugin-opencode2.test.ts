@@ -7,7 +7,7 @@ import { CursorPlugin } from "../src/plugin.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE } from "../src/opencode2/catalog.js"
 import { applyCursorIntegration, accessTokenFromCredential } from "../src/opencode2/integration.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
-import { clearSessionDirectories, getSessionDirectory } from "../src/session-directory.js"
+import { clearSessionDirectories, getSessionDirectory, opencodeDirectoryHeader } from "../src/session-directory.js"
 import {
   flushPlanExecutionKickoff,
   hasPlanExecutionKickoff,
@@ -983,6 +983,43 @@ describe("opencode2 setup", () => {
     await hook({ sessionID: "s-flat", agent: "build", model: { providerID: "cursor" } })
 
     expect(getSessionDirectory("s-flat")).toBe("/home/user/projects/flat-app")
+  })
+
+  test("model.request carries the session directory as x-opencode-directory", async () => {
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-dir", "/home/user/a b")
+    await plugin.setup(ctx)
+
+    const event = {
+      sessionID: "s-dir",
+      model: { providerID: "cursor", id: "auto" },
+      headers: { "x-session-id": "s-dir" } as Record<string, string>,
+    }
+    await hooks.get("session.model.request")!(event)
+
+    expect(event.headers["x-session-id"]).toBe("s-dir")
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/home/user/a b")
+  })
+
+  test("model.request falls back to the plugin location when the session lookup fails", async () => {
+    const { ctx, hooks } = fakeContext()
+    await plugin.setup(ctx)
+
+    const event = { sessionID: "s-missing", model: { providerID: "cursor", id: "auto" }, headers: {} as Record<string, string> }
+    await hooks.get("session.model.request")!(event)
+
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/workspace")
+  })
+
+  test("model.request leaves other providers' headers alone", async () => {
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-other", "/proj")
+    await plugin.setup(ctx)
+
+    const event = { sessionID: "s-other", model: { providerID: "openai", id: "gpt" }, headers: {} as Record<string, string> }
+    await hooks.get("session.model.request")!(event)
+
+    expect(event.headers).toEqual({})
   })
 
   test("a failed session lookup does not throw and leaves the directory unset", async () => {

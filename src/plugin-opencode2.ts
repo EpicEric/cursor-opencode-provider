@@ -27,6 +27,7 @@ import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
 import { markSessionDirectory } from "./session-directory.js"
+import { trace } from "./debug.js"
 import {
   cancelPlanExecutionKickoff,
   createPlanExecutionKickoffText,
@@ -416,8 +417,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         // OpenCode 2.0 stable exposes a flat `directory`; older shapes nest it
         // under `location.directory`. Prefer the flat field when both exist.
         markSessionDirectory(sessionID, info.directory ?? info.location?.directory)
-      } catch {
+      } catch (error) {
         // Best effort — falls back to the static workspaceRoot above.
+        trace(`session directory: session.get failed sessionID=${sessionID}: ${String(error)}`)
       }
     }
 
@@ -440,6 +442,25 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           }
         }
         await rememberSessionDirectory(event.sessionID)
+      }),
+    )
+
+    // OpenCode loads one copy of this module per Location, and the SDK serving a
+    // session's request is not necessarily the copy whose hooks marked that
+    // session. The header travels with the request, so it reaches whichever
+    // copy runs the model.
+    await track(
+      ctx.session.hook("model.request", async (event) => {
+        if (event.model.providerID !== CURSOR_PROVIDER_ID) return
+        const directory = await ctx.session
+          .get({ sessionID: event.sessionID })
+          .then((info) => (info as { directory?: string }).directory ?? info.location?.directory)
+          .catch((error: unknown) => {
+            trace(`model.request: session.get failed sessionID=${event.sessionID}: ${String(error)}`)
+            return undefined
+          }) ?? ctx.location?.directory
+        if (!directory) return
+        event.headers = { ...event.headers, "x-opencode-directory": encodeURIComponent(directory) }
       }),
     )
 

@@ -301,11 +301,19 @@ export type SessionTitle = {
   result?: string
 }
 
+/** Outbound request headers; they reach the AI SDK as `callOptions.headers`. */
+export type SessionModelRequest = {
+  readonly sessionID: string
+  readonly model: { providerID: string; id: string; variant?: string }
+  headers: Record<string, string>
+}
+
 export type SessionHooks = {
   readonly context: SessionContext
   readonly compaction: SessionCompaction
   readonly generate: SessionGenerate
   readonly title: SessionTitle
+  readonly "model.request": SessionModelRequest
 }
 
 /** Only the `location.directory` field we actually read. */

@@ -184,6 +184,14 @@ export type HostPluginContext = {
         options?: Record<string, unknown>
         result?: string
       }
+      "model.request": {
+        readonly sessionID: string
+        readonly agent: string
+        readonly model: { providerID: string; id: string; variant?: string }
+        readonly kind: "primary" | "compaction" | "title" | "generate"
+        baseURL?: string
+        headers: Record<string, string>
+      }
     }>
     readonly get: (input: { sessionID: string }) => Promise<{
       readonly id: string

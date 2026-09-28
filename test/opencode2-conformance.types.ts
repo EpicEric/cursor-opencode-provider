@@ -123,6 +123,10 @@ void (() =>
 
 void (() => ctx.session.hook("generate", (event) => void event.sessionID))
 void (() => ctx.session.hook("title", (event) => void event.sessionID))
+void (() =>
+  ctx.session.hook("model.request", (event) => {
+    event.headers = { ...event.headers, "x-opencode-directory": event.sessionID }
+  }))
 
 void (async () => {
   const info = await ctx.session.get({ sessionID: "s" })
