@@ -4,8 +4,13 @@ import type { ToolDraft } from "./types.js"
  * OpenCode 2 puts an MCP server's tools in Code Mode unless that server's
  * config sets `codemode: false` (`packages/schema/src/mcp.ts`, applied in
  * `packages/core/src/tool/mcp.ts`). Only `options.codemode === false` joins
- * the AI SDK catalog (`packages/core/src/tool.ts`). Cursor can call a tool
- * only when it is in that catalog.
+ * the AI SDK catalog (`packages/core/src/tool.ts`). This provider can advertise
+ * a tool to Cursor only when it is in that catalog.
+ *
+ * That AI SDK placement is necessary but not sufficient for Cursor models:
+ * non-native tools are still invoked through GetDynamicTools / CallDynamicTool
+ * (see `src/context/dynamic-catalog.ts`, issue #29). Classic OpenCode 1.x already
+ * puts MCP tools in the AI SDK catalog; this module is the OpenCode 2 equivalent.
  *
  * `config.codemode` is also the remote-connection switch: while it is not
  * false, OpenCode appends `?codemode=false` so servers that bundle their own

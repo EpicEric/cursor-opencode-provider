@@ -326,8 +326,9 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
         // the host does not already own those names. When off, register none.
         registerTodoTools(draft)
         // MCP tools default into Code Mode. Move every server that did not
-        // explicitly opt in onto the direct catalog so Cursor can call them
-        // by name. See `opencode2/mcp-direct.ts`.
+        // explicitly opt in onto the direct catalog so this provider can
+        // advertise them to Cursor (issue #29 still routes via CallDynamicTool).
+        // See `opencode2/mcp-direct.ts`.
         exposeDirectMcpTools(draft, directMcpNamespaces)
       }),
     )

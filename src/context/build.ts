@@ -28,6 +28,11 @@ export type BuildRequestContextInput = {
   providerIdentifier?: string
   /** When set, skills/subagents/plugins are epoch-held for this conversation. */
   conversationId?: string
+  /**
+   * Preloaded merged `opencode.json` from the same Run (e.g. for interaction
+   * guidance MCP server ids). Skips a second `loadMergedConfig` disk read.
+   */
+  mergedConfig?: OpencodeJson
 }
 
 export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
@@ -100,7 +105,7 @@ export async function buildRequestContext(
   input: BuildRequestContextInput,
 ): Promise<Record<string, unknown>> {
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
-  const { rules, config, worktree } = await collectRules(workspaceRoot)
+  const { rules, config, worktree } = await collectRules(workspaceRoot, input.mergedConfig)
   const [dynamic, git, layout] = await Promise.all([
     buildDynamicRequestContextFromDiscovery(input, workspaceRoot, worktree, config),
     collectGit(workspaceRoot),
@@ -223,7 +228,9 @@ export async function buildDynamicRequestContext(
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
   const [worktree, config] = await Promise.all([
     findGitWorktree(workspaceRoot),
-    loadMergedConfig(workspaceRoot),
+    input.mergedConfig
+      ? Promise.resolve(input.mergedConfig)
+      : loadMergedConfig(workspaceRoot),
   ])
   return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, worktree, config)
 }

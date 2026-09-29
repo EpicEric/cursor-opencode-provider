@@ -506,6 +506,24 @@ describe("mapCursorArgsToOpencode", () => {
     })
     expect(r).toEqual({ toolName: "bash", args: { command: "ls", workdir: "/tmp", timeout: 5000 } })
   })
+  it("remaps skill args to the host schema key (OpenCode 1 name / OpenCode 2 id)", () => {
+    expect(mapCursorArgsToOpencode("skill", { name: "ab-probe" }, "mcp_args")).toEqual({
+      toolName: "skill",
+      args: { name: "ab-probe" },
+    })
+    expect(mapCursorArgsToOpencode("skill", { id: "ab-probe" }, "mcp_args")).toEqual({
+      toolName: "skill",
+      args: { name: "ab-probe" },
+    })
+    expect(mapCursorArgsToOpencode("skill", { name: "ab-probe" }, "mcp_args", OPENCODE_2_TOOL_DIALECT)).toEqual({
+      toolName: "skill",
+      args: { id: "ab-probe" },
+    })
+    expect(mapCursorArgsToOpencode("skill", { id: "ab-probe", name: "ignored" }, undefined, OPENCODE_2_TOOL_DIALECT)).toEqual({
+      toolName: "skill",
+      args: { id: "ab-probe" },
+    })
+  })
   it("remaps grep glob → include", () => {
     const r = mapCursorArgsToOpencode("grep", { pattern: "foo", path: "/src", glob: "*.ts" })
     expect(r).toEqual({ toolName: "grep", args: { pattern: "foo", path: "/src", include: "*.ts" } })
@@ -569,7 +587,7 @@ describe("OpenCode 2 host tool dialect", () => {
   ])
 
   it("detects path + shell from OpenCode 2.0 schemas", () => {
-    expect(oc2).toEqual({ filePathKey: "path", shellTool: "shell" })
+    expect(oc2).toEqual({ filePathKey: "path", shellTool: "shell", skillArgKey: "id" })
   })
 
   it("emits path not filePath for read/write/edit", () => {
@@ -643,6 +661,7 @@ describe("OpenCode 2 host tool dialect", () => {
     expect(hostToolDialectFromTools([{ name: "shell" }])).toEqual({
       filePathKey: "path",
       shellTool: "shell",
+      skillArgKey: "id",
     })
   })
 
@@ -650,6 +669,7 @@ describe("OpenCode 2 host tool dialect", () => {
     expect(hostToolDialectFromTools([], OPENCODE_2_TOOL_DIALECT)).toEqual({
       filePathKey: "path",
       shellTool: "shell",
+      skillArgKey: "id",
     })
   })
 
@@ -657,7 +677,23 @@ describe("OpenCode 2 host tool dialect", () => {
     expect(hostToolDialectFromTools([{ name: "read", inputSchema: { parameters: { properties: { path: { type: "string" } } } } }])).toEqual({
       filePathKey: "path",
       shellTool: "bash",
+      skillArgKey: "name",
     })
+  })
+
+  it("detects skill arg key from advertised skill schema", () => {
+    expect(
+      hostToolDialectFromTools([
+        { name: "bash" },
+        { name: "skill", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
+      ]),
+    ).toEqual({ filePathKey: "filePath", shellTool: "bash", skillArgKey: "name" })
+    expect(
+      hostToolDialectFromTools([
+        { name: "shell" },
+        { name: "skill", inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+      ]),
+    ).toEqual({ filePathKey: "path", shellTool: "shell", skillArgKey: "id" })
   })
 })
 

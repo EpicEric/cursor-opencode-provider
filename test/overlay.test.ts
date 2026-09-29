@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "bun:test"
 import {
+  getHeldOverlaySkills,
   holdCapabilityOverlay,
   resetOverlayHoldsForTests,
   transferOverlayHold,
@@ -107,5 +108,12 @@ describe("holdCapabilityOverlay", () => {
       plugins: [],
     })
     expect(grown.skills.map((skill) => skill.content)).toEqual(["z-body", "a-body"])
+  })
+
+  it("exposes held skill ids that the wire shape drops", () => {
+    const held = holdCapabilityOverlay("conv", { skills: [zebra, alpha], subagents: [], plugins: [] })
+    expect(held.skills[0]).not.toHaveProperty("id")
+    expect(getHeldOverlaySkills("conv").map((skill) => skill.id)).toEqual(["alpha", "zebra"])
+    expect(getHeldOverlaySkills("missing")).toEqual([])
   })
 })
