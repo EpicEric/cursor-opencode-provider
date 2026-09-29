@@ -25,6 +25,17 @@ export type Hooks<Spec> = <Name extends keyof Spec>(
   callback: (input: Spec[Name]) => Promise<void> | void,
 ) => Promise<Registration>
 
+export type ModelHookOptions = {
+  /** Limits the hook to one provider; the host skips events for any other. */
+  readonly providerID?: string
+}
+
+export type ModelHooks<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  callback: (input: Spec[Name]) => Promise<void> | void,
+  options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
+) => Promise<Registration>
+
 export type Transform<Input> = (callback: (input: Input) => void) => Promise<Registration>
 
 // ── Schema shapes this plugin publishes (runtime duck-type, not the host SDK) ──
@@ -301,11 +312,25 @@ export type SessionTitle = {
   result?: string
 }
 
+/**
+ * Outbound request headers / route overrides for one model call.
+ * Headers reach the AI SDK as `callOptions.headers`.
+ */
+export type SessionModelRequest = {
+  readonly sessionID: string
+  readonly agent: string
+  readonly model: { providerID: string; id: string; variant?: string }
+  readonly kind: "primary" | "compaction" | "title" | "generate"
+  baseURL?: string
+  headers: Record<string, string>
+}
+
 export type SessionHooks = {
   readonly context: SessionContext
   readonly compaction: SessionCompaction
   readonly generate: SessionGenerate
   readonly title: SessionTitle
+  readonly "model.request": SessionModelRequest
 }
 
 /** Only the `location.directory` field we actually read. */
@@ -315,7 +340,7 @@ export type SessionInfo = {
 }
 
 export type SessionDomain = {
-  readonly hook: Hooks<SessionHooks>
+  readonly hook: ModelHooks<SessionHooks>
   readonly get: (input: { sessionID: string }) => Promise<SessionInfo>
   readonly switchAgent?: (input: { sessionID: string; agent: string }) => Promise<void>
   readonly synthetic?: (input: {

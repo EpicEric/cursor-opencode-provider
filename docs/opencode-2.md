@@ -99,8 +99,8 @@ Prefer the `$OPENCODE_CONFIG_DIR/plugins/<name>/` package directory shown above.
 
 OpenCode 2.0's long-lived daemon often starts from `$HOME` (or another spawn cwd), so `process.cwd()` is not the active project. The provider resolves the session workspace in this order:
 
-1. Request header `x-opencode-directory` (URI-encoded absolute path; per-request)
-2. Session mark from `session.hook("context")` → `ctx.session.get()` (`info.directory`, or legacy `info.location.directory`)
+1. Request header `x-opencode-directory` (URI-encoded absolute path; per-request). The plugin adds it on `session.hook("model.request")` for the `cursor` provider from `ctx.session.get()` → `info.location.directory`, falling back to the last known session directory, then `ctx.location.directory`. It rides the AI SDK call options only and is never sent to Cursor, so it does not depend on in-memory state shared with the module copy that runs the model.
+2. Session mark from session hooks → `ctx.session.get()` (`info.location.directory`) — fallback within the same module copy only
 3. Static `createSdk({ workspaceRoot })` / process cwd as last resort
 
 The plugin also forces OpenCode 2's `path` / `shell` tool dialect when advertised schemas are opaque, so bridged file tools do not fall back to OpenCode 1.x `filePath` / `bash` under a multi-project daemon.

@@ -1,13 +1,19 @@
 import { describe, expect, test, beforeEach } from "bun:test"
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE } from "../src/opencode2/catalog.js"
 import { applyCursorIntegration, accessTokenFromCredential } from "../src/opencode2/integration.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
-import { clearSessionDirectories, getSessionDirectory } from "../src/session-directory.js"
+import {
+  clearSessionDirectories,
+  getSessionDirectory,
+  markSessionDirectory,
+  opencodeDirectoryHeader,
+  resolveSessionWorkspaceRoot,
+} from "../src/session-directory.js"
 import {
   flushPlanExecutionKickoff,
   hasPlanExecutionKickoff,
@@ -414,8 +420,14 @@ function fakeContext(events: readonly unknown[] = []) {
     return { dispose: async () => void disposed.push(label) }
   }
   const hookDomain = (domain: string) => ({
-    hook: async (name: string, callback: (input: any) => any) => {
-      hooks.set(`${domain}.${name}`, callback)
+    hook: async (name: string, callback: (input: any) => any, options?: { providerID?: string }) => {
+      // Mirror the host's ModelHookOptions scoping: a scoped hook skips events
+      // for any other provider (opencode `packages/core/src/plugin/hooks.ts`).
+      hooks.set(`${domain}.${name}`, (input: any) =>
+        options?.providerID !== undefined && options.providerID !== input?.model?.providerID
+          ? undefined
+          : callback(input),
+      )
       return registration(`${domain}.${name}`)
     },
   })
@@ -970,19 +982,82 @@ describe("opencode2 setup", () => {
     expect(getSessionDirectory("s1")).toBe("/home/user/projects/my-app")
   })
 
-  test("the session hook records the session directory from info.directory (flat OpenCode 2.0 shape)", async () => {
+  const modelRequest = (sessionID: string, providerID = "cursor", headers: Record<string, string> = {}) => ({
+    sessionID,
+    agent: "build",
+    model: { providerID, id: "auto" },
+    kind: "primary" as const,
+    headers,
+  })
+
+  test("model.request carries the session directory as x-opencode-directory", async () => {
     clearSessionDirectories()
-    const { ctx, hooks } = fakeContext()
-    ctx.session.get = async ({ sessionID }: { sessionID: string }) => ({
-      id: sessionID,
-      directory: "/home/user/projects/flat-app",
-    })
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-dir", "/home/user/a b")
     await plugin.setup(ctx)
 
-    const hook = hooks.get("session.context")!
-    await hook({ sessionID: "s-flat", agent: "build", model: { providerID: "cursor" } })
+    const event = modelRequest("s-dir", "cursor", { "x-session-id": "s-dir" })
+    await hooks.get("session.model.request")!(event)
 
-    expect(getSessionDirectory("s-flat")).toBe("/home/user/projects/flat-app")
+    expect(event.headers["x-session-id"]).toBe("s-dir")
+    expect(event.headers["x-opencode-directory"]).toBe("%2Fhome%2Fuser%2Fa%20b")
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/home/user/a b")
+    expect(getSessionDirectory("s-dir")).toBe("/home/user/a b")
+  })
+
+  test("model.request header overrides a stale session mark in the language model", async () => {
+    clearSessionDirectories()
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-moved", "/home/user/new-project")
+    await plugin.setup(ctx)
+
+    const event = modelRequest("s-moved")
+    await hooks.get("session.model.request")!(event)
+    // Another module copy still holds the pre-move directory.
+    markSessionDirectory("s-moved", "/home/user/old-project")
+
+    expect(
+      resolveSessionWorkspaceRoot({ sessionKey: "s-moved", headers: event.headers, workspaceRoot: "/workspace" }),
+    ).toBe(resolve("/home/user/new-project"))
+  })
+
+  test("model.request keeps the last known session directory when the lookup fails", async () => {
+    clearSessionDirectories()
+    const { ctx, hooks } = fakeContext()
+    await plugin.setup(ctx)
+    markSessionDirectory("s-known", "/home/user/known")
+
+    const event = modelRequest("s-known")
+    await hooks.get("session.model.request")!(event)
+
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/home/user/known")
+    expect(getSessionDirectory("s-known")).toBe("/home/user/known")
+  })
+
+  test("model.request falls back to the plugin location when the session is unknown", async () => {
+    clearSessionDirectories()
+    const { ctx, hooks } = fakeContext()
+    await plugin.setup(ctx)
+
+    const event = modelRequest("s-missing")
+    await hooks.get("session.model.request")!(event)
+
+    expect(opencodeDirectoryHeader(event.headers)).toBe("/workspace")
+    // The fallback is not a session fact; do not record it as one.
+    expect(getSessionDirectory("s-missing")).toBeUndefined()
+  })
+
+  test("model.request leaves other providers' headers alone", async () => {
+    clearSessionDirectories()
+    const { ctx, hooks, sessionLocations } = fakeContext()
+    sessionLocations.set("s-other", "/proj")
+    await plugin.setup(ctx)
+
+    const event = modelRequest("s-other", "openai")
+    await hooks.get("session.model.request")!(event)
+
+    expect(event.headers).toEqual({})
+    expect(getSessionDirectory("s-other")).toBeUndefined()
   })
 
   test("a failed session lookup does not throw and leaves the directory unset", async () => {

@@ -18,6 +18,12 @@ export type HostHooks<Spec> = <Name extends keyof Spec>(
   callback: (input: Spec[Name]) => Promise<void> | void,
 ) => Promise<HostRegistration>
 
+export type HostModelHooks<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  callback: (input: Spec[Name]) => Promise<void> | void,
+  options?: Spec[Name] extends { readonly model: unknown } ? { readonly providerID?: string } : never,
+) => Promise<HostRegistration>
+
 export type HostConnectionInfo =
   | { type: "credential"; id: string; label: string }
   | { type: "env"; name: string }
@@ -147,7 +153,7 @@ export type HostPluginContext = {
   }
   readonly location: { readonly directory: string }
   readonly session: {
-    readonly hook: HostHooks<{
+    readonly hook: HostModelHooks<{
       context: {
         readonly sessionID: string
         readonly agent: string
@@ -183,6 +189,14 @@ export type HostPluginContext = {
         messages: Array<any>
         options?: Record<string, unknown>
         result?: string
+      }
+      "model.request": {
+        readonly sessionID: string
+        readonly agent: string
+        readonly model: { providerID: string; id: string; variant?: string }
+        readonly kind: "primary" | "compaction" | "title" | "generate"
+        baseURL?: string
+        headers: Record<string, string>
       }
     }>
     readonly get: (input: { sessionID: string }) => Promise<{
