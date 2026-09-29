@@ -26,7 +26,7 @@ import { registerTodoTools } from "./opencode2/todo-tools.js"
 import { OPENCODE_2_TOOL_DIALECT } from "./protocol/tools.js"
 import { clearSessionTodos } from "./todo-store.js"
 import { markCompactionSession } from "./compaction-marker.js"
-import { markSessionDirectory } from "./session-directory.js"
+import { getSessionDirectory, markSessionDirectory } from "./session-directory.js"
 import { trace } from "./debug.js"
 import {
   cancelPlanExecutionKickoff,
@@ -262,8 +262,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
           ...(token ? { accessToken: token } : {}),
           // Static fallback only. This hook fires once per model/package, not
           // per session, and 2.0 runs one daemon across many projects — the
-          // real per-request directory comes from `x-opencode-directory` and
-          // the session.context hook below via `getSessionDirectory`.
+          // real per-request directory comes from `x-opencode-directory`
+          // (set on `session.model.request`) and the session-directory mark.
           workspaceRoot,
           cacheDir,
           ...event.options,
@@ -410,13 +410,8 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
 
     const rememberSessionDirectory = async (sessionID: string) => {
       try {
-        const info = (await ctx.session.get({ sessionID })) as {
-          directory?: string
-          location?: { directory?: string }
-        }
-        // OpenCode 2.0 stable exposes a flat `directory`; older shapes nest it
-        // under `location.directory`. Prefer the flat field when both exist.
-        markSessionDirectory(sessionID, info.directory ?? info.location?.directory)
+        const info = await ctx.session.get({ sessionID })
+        markSessionDirectory(sessionID, info.location.directory)
       } catch (error) {
         // Best effort — falls back to the static workspaceRoot above.
         trace(`session directory: session.get failed sessionID=${sessionID}: ${String(error)}`)
@@ -445,23 +440,35 @@ const plugin: Plugin2 & { server: typeof CursorPlugin } = {
       }),
     )
 
-    // OpenCode loads one copy of this module per Location, and the SDK serving a
-    // session's request is not necessarily the copy whose hooks marked that
-    // session. The header travels with the request, so it reaches whichever
-    // copy runs the model.
+    // The session mark lives in module state, and OpenCode re-evaluates a local
+    // plugin's module graph per Location, so the copy running the model may not
+    // hold it. The header travels with the request (AI SDK
+    // `callOptions.headers` → `resolveSessionWorkspaceRoot`) and never reaches
+    // Cursor. Only a successful lookup updates the mark; on failure keep the
+    // last known session directory ahead of this Location's static root.
+    // Scoped by the host to this provider: other providers' requests never
+    // reach the callback, so the header cannot leak to their endpoints.
     await track(
-      ctx.session.hook("model.request", async (event) => {
-        if (event.model.providerID !== CURSOR_PROVIDER_ID) return
-        const directory = await ctx.session
-          .get({ sessionID: event.sessionID })
-          .then((info) => (info as { directory?: string }).directory ?? info.location?.directory)
-          .catch((error: unknown) => {
-            trace(`model.request: session.get failed sessionID=${event.sessionID}: ${String(error)}`)
-            return undefined
-          }) ?? ctx.location?.directory
-        if (!directory) return
-        event.headers = { ...event.headers, "x-opencode-directory": encodeURIComponent(directory) }
-      }),
+      ctx.session.hook(
+        "model.request",
+        async (event) => {
+          const current = await ctx.session
+            .get({ sessionID: event.sessionID })
+            .then((info) => info.location.directory)
+            .catch((error: unknown) => {
+              trace(`model.request: session.get failed sessionID=${event.sessionID}: ${String(error)}`)
+              return undefined
+            })
+          markSessionDirectory(event.sessionID, current)
+          const directory = current ?? getSessionDirectory(event.sessionID) ?? ctx.location?.directory
+          if (!directory) return
+          event.headers = {
+            ...event.headers,
+            "x-opencode-directory": encodeURIComponent(directory),
+          }
+        },
+        { providerID: CURSOR_PROVIDER_ID },
+      ),
     )
 
     await track(

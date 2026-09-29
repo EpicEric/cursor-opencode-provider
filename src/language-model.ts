@@ -1051,8 +1051,9 @@ async function startSession(
   // v1 sets `options.workspaceRoot` correctly per invocation (`input.directory`,
   // one plugin instance per project). OpenCode 2.0 runs one daemon across many
   // projects, so its static option is only a last-resort fallback. Prefer the
-  // per-request `x-opencode-directory` header, then the session mark recorded
-  // from `session.hook("context")` via `getSessionDirectory`.
+  // per-request `x-opencode-directory` header (set by the 2.0 plugin's
+  // `session.hook("model.request")`), then the session mark recorded from the
+  // session hooks via `getSessionDirectory`.
   const workspaceRoot = resolveSessionWorkspaceRoot({
     sessionKey,
     headers: callOptions.headers,
