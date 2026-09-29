@@ -160,6 +160,12 @@ import {
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getOrBuildRequestContext } from "./context/frozen.js"
+import { getHeldOverlaySkills } from "./context/overlay.js"
+import { loadMergedConfig } from "./context/rules.js"
+import {
+  buildDynamicCatalogRoutingInstruction,
+  buildSkillCatalogNudge,
+} from "./context/dynamic-catalog.js"
 import {
   admitContextEpoch,
   appendMidConversationMessage,
@@ -1066,7 +1072,13 @@ async function startSession(
     workspaceRoot: options.workspaceRoot,
   })
   const baseSystemPrompt = extractSystemPrompt(prompt)
-  const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot)
+  // One merged-config load per Run: guidance MCP ids and RequestContext
+  // descriptors must agree, and warm turns must not pay for a second disk read.
+  const mergedConfig = isCompaction ? undefined : await loadMergedConfig(workspaceRoot)
+  const knownMcpServers = Object.keys(mergedConfig?.mcp ?? {})
+  const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot, {
+    knownMcpServers,
+  })
   // Prompt-identity diagnostics are filled after Context Epoch admission below
   // (baseline hash is the epoch baseline, not a per-turn host hash).
   let frozenSystemPromptHash: string | undefined
@@ -1126,6 +1138,9 @@ async function startSession(
   let userText = recovery?.kind === "rebase"
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
+  // Skill matching must see the live user utterance only — not Mid-Conversation
+  // MCP/system injections appended below (those false-trigger firecrawl dumps).
+  const skillMatchText = userText
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
   // (same <system_reminder> contract the CLI uses after flipping unifiedMode).
   const startedWithCheckpoint = !!conversationState
@@ -1267,8 +1282,23 @@ async function startSession(
   // Run mutates volatile slices (git porcelain, layout) and breaks prompt cache.
   const { context: requestContext, reused: requestContextReused } = await getOrBuildRequestContext(
     conversationId,
-    { workspaceRoot, tools: cursorTools },
+    { workspaceRoot, tools: cursorTools, mergedConfig },
   )
+  // Issue #29: after skills are in RequestContext, nudge matched skill ids onto
+  // the Mid-Conversation channel so models CallDynamicTool(`skill`) instead of
+  // Grep/Read SKILL.md. Shared by OpenCode 1.x and 2.0 catalogs. Gate on the
+  // host-permitted set, not the epoch-held advertisement: a turn that withheld
+  // `skill` would refuse the call this nudge asks for.
+  if (!isCompaction && !lifecycle) {
+    const skillDialect = hostToolDialectFromTools(tools, options.defaultDialect)
+    const skillNudge = buildSkillCatalogNudge({
+      hasSkillTool: allowTools && incomingTools.some((tool) => tool.name === "skill"),
+      skills: getHeldOverlaySkills(conversationId),
+      userText: skillMatchText,
+      skillArgKey: skillDialect.skillArgKey,
+    })
+    userText = appendMidConversationMessage(userText, skillNudge)
+  }
   const contextSubagents = Array.isArray(requestContext.custom_subagents)
     ? requestContext.custom_subagents
         .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"
@@ -1382,7 +1412,7 @@ async function startSession(
   const hostToolDialect = hostToolDialectFromTools(tools, options.defaultDialect)
   trace(
     `host tool dialect: filePathKey=${hostToolDialect.filePathKey} shellTool=${hostToolDialect.shellTool} ` +
-      `tools=[${tools.map((t) => t.name).join(",")}]`,
+      `skillArgKey=${hostToolDialect.skillArgKey} tools=[${tools.map((t) => t.name).join(",")}]`,
   )
 
   const session: CursorSession = {
@@ -3967,6 +3997,7 @@ export function buildOpenCodeInteractionGuidance(
   tools: OpencodeToolDef[],
   isCompaction: boolean,
   workspaceRoot: string,
+  options: { knownMcpServers?: Iterable<string> } = {},
 ): string | undefined {
   if (isCompaction) return undefined
   const names = new Set(tools.map((tool) => tool.name))
@@ -4060,6 +4091,15 @@ export function buildOpenCodeInteractionGuidance(
         "- Host `scout` is available for external documentation and dependency-source research. Use Cursor `cursor-guide` for that use case; local repository discovery still uses `bugbot`/`explore`.",
       )
     }
+  }
+  // Issue #29: skill/MCP stay off Cursor's native top-level list on both
+  // OpenCode 1.x and 2.0 — route them through the dynamic catalog instead.
+  {
+    const dynamicCatalog = buildDynamicCatalogRoutingInstruction({
+      toolNames: tools.map((tool) => tool.sourceName ?? tool.name),
+      knownMcpServers: options.knownMcpServers,
+    })
+    if (dynamicCatalog) instructions.push(dynamicCatalog)
   }
   if (names.has("write")) {
     instructions.push(

@@ -7,6 +7,13 @@ export {
   type BuildRequestContextInput,
 } from "./build.js"
 export {
+  buildDynamicCatalogRoutingInstruction,
+  buildSkillCatalogNudge,
+  listAdvertisedMcpServers,
+  skillNameFromAgentSkill,
+  type AgentSkillLike,
+} from "./dynamic-catalog.js"
+export {
   clearFrozenRequestContext,
   getFrozenRequestContext,
   getOrBuildRequestContext,

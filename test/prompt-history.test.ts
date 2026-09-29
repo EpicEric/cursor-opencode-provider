@@ -218,6 +218,52 @@ describe("buildOpenCodeInteractionGuidance", () => {
     expect(guidance).toContain("Spawnable host agents this turn: `explore`, `general`.")
     expect(guidance).not.toContain("OpenCode `task`")
   })
+
+  it("routes advertised skill and MCP tools through the dynamic catalog (issue #29)", () => {
+    const withBoth = buildOpenCodeInteractionGuidance([
+      { name: "skill" },
+      { name: "context7_resolve-library-id" },
+      { name: "context7_query-docs" },
+      { name: "codesearch_find" },
+      { name: "apply_patch" },
+      { name: "read" },
+      { name: "grep" },
+    ], false, "/workspace/project", { knownMcpServers: ["context7", "codesearch"] })
+    expect(withBoth).toContain("`skill`")
+    expect(withBoth).toContain("MCP servers such as `context7`, `codesearch`")
+    expect(withBoth).toContain("GetDynamicTools / CallDynamicTool")
+    expect(withBoth).toContain("before Grep/Shell fallbacks")
+    expect(withBoth).toContain("Do not narrate that they are unavailable")
+
+    const skillOnly = buildOpenCodeInteractionGuidance([
+      { name: "skill" },
+      { name: "read" },
+    ], false, "/workspace/project")
+    expect(skillOnly).toContain("including `skill`")
+    expect(skillOnly).not.toContain("MCP servers such as")
+
+    const withoutExtras = buildOpenCodeInteractionGuidance([
+      { name: "read" },
+      { name: "grep" },
+      { name: "custom_websearch" },
+    ], false, "/workspace/project")
+    expect(withoutExtras).not.toContain("GetDynamicTools / CallDynamicTool")
+
+    const unconfigured = buildOpenCodeInteractionGuidance([
+      { name: "context7_query-docs" },
+      { name: "read" },
+    ], false, "/workspace/project")
+    expect(unconfigured).not.toContain("GetDynamicTools / CallDynamicTool")
+
+    // Collision-safe aliases keep the OpenCode id on sourceName; guidance must
+    // still resolve the configured MCP server from that id, not the alias.
+    const aliased = buildOpenCodeInteractionGuidance([
+      { name: "custom_docs", sourceName: "context7_query-docs" },
+      { name: "read" },
+    ], false, "/workspace/project", { knownMcpServers: ["context7"] })
+    expect(aliased).toContain("MCP servers such as `context7`")
+    expect(aliased).toContain("GetDynamicTools / CallDynamicTool")
+  })
 })
 
 describe("extractPromptHistory", () => {

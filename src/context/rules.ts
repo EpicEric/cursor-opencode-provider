@@ -184,8 +184,12 @@ export async function loadMergedConfig(workspaceRoot: string): Promise<OpencodeJ
 
 /**
  * Collect OpenCode instruction files.
+ * `preloadedConfig` reuses a merged config already loaded on this Run.
  */
-export async function collectRules(workspaceRoot: string): Promise<{
+export async function collectRules(
+  workspaceRoot: string,
+  preloadedConfig?: OpencodeJson,
+): Promise<{
   rules: CollectedRule[]
   config: OpencodeJson
   worktree: string
@@ -193,7 +197,7 @@ export async function collectRules(workspaceRoot: string): Promise<{
   const worktree = await findGitWorktree(workspaceRoot)
   const rules: CollectedRule[] = []
   const seen = new Set<string>()
-  const config = await loadMergedConfig(workspaceRoot)
+  const config = preloadedConfig ?? await loadMergedConfig(workspaceRoot)
 
   const add = async (file: string | undefined) => {
     if (!file) return

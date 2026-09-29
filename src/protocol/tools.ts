@@ -42,17 +42,23 @@ export type OpencodeToolDef = {
 export type HostFilePathKey = "path" | "filePath"
 /** Host shell tool id. OpenCode 1.x uses `bash`; 2.0 uses `shell`. */
 export type HostShellTool = "bash" | "shell"
+/** OpenCode 1.x skill params use `name`; OpenCode 2.0 uses `id`. */
+export type HostSkillArgKey = "name" | "id"
+
 export type HostToolDialect = {
   filePathKey: HostFilePathKey
   shellTool: HostShellTool
+  skillArgKey: HostSkillArgKey
 }
 export const OPENCODE_1_TOOL_DIALECT: HostToolDialect = {
   filePathKey: "filePath",
   shellTool: "bash",
+  skillArgKey: "name",
 }
 export const OPENCODE_2_TOOL_DIALECT: HostToolDialect = {
   filePathKey: "path",
   shellTool: "shell",
+  skillArgKey: "id",
 }
 
 function jsonSchemaProperties(schema: unknown): Record<string, unknown> | undefined {
@@ -80,6 +86,7 @@ export function opencodePathArg(args: Record<string, unknown> | undefined): stri
 /**
  * Infer the host tool dialect from advertised AI SDK schemas.
  * OpenCode 2.0 read/edit/write require `path` and rename bash → `shell`.
+ * Skill: OpenCode 1.x requires `name`; OpenCode 2.0 requires `id`.
  */
 export function hostToolDialectFromTools(
   tools: readonly { name?: string; inputSchema?: unknown }[],
@@ -109,7 +116,19 @@ export function hostToolDialectFromTools(
     // OpenCode 2 hosts advertise `shell` and `path` together; use that when schemas are opaque.
     filePathKey = shellTool === "shell" ? "path" : defaultDialect.filePathKey
   }
-  return { filePathKey, shellTool }
+  const skillProps = jsonSchemaProperties(tools.find((tool) => tool.name === "skill")?.inputSchema)
+  let skillArgKey: HostSkillArgKey | undefined
+  if (skillProps) {
+    if ("id" in skillProps && !("name" in skillProps)) skillArgKey = "id"
+    else if ("name" in skillProps) skillArgKey = "name"
+  }
+  if (!skillArgKey) {
+    // Opaque skill schema: OpenCode 2 pairs `shell`+`path` with skill `id`.
+    skillArgKey = shellTool === "shell" && filePathKey === "path"
+      ? "id"
+      : defaultDialect.skillArgKey
+  }
+  return { filePathKey, shellTool, skillArgKey }
 }
 
 function assignHostFilePath(
@@ -1445,6 +1464,17 @@ export function mapCursorArgsToOpencode(
       const path = str(cleaned.path) ?? str(cleaned.target_directory) ?? str(cleaned.targetDirectory)
       if (path) args.path = path
       return { toolName: "glob", args }
+    }
+    case "skill": {
+      // OpenCode 1.x skill requires `name`; OpenCode 2.0 requires `id`. Both
+      // reject the other key (`additionalProperties: false`). Accept either
+      // model/Cursor shape and emit only the dialect key.
+      const value = str(cleaned[dialect.skillArgKey]) ?? str(cleaned.id) ?? str(cleaned.name)
+      const args: Record<string, unknown> = { ...cleaned }
+      delete args.id
+      delete args.name
+      if (value) args[dialect.skillArgKey] = value
+      return { toolName: "skill", args }
     }
     default:
       return { toolName, args: cleaned }

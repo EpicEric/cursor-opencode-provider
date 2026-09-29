@@ -113,6 +113,8 @@ The plugin leaves that server config alone. `codemode` on the server also decide
 
 The tool registry is shared by every provider in the process. A server that should stay in Code Mode for other models needs `"codemode": true` in its MCP config.
 
+**Cursor layer (OpenCode 1.x and 2.0):** joining the AI SDK / direct catalog is what lets this provider advertise the tool in RequestContext. Cursor still keeps those tools off its native top-level function list — models reach them through GetDynamicTools / CallDynamicTool (and the provider's `mcp_args` exec path). When the host advertises `skill` and/or tools of MCP servers configured in `opencode.json`, shared interaction guidance names those routes. When the host permits `skill` this turn and the user message names a discovered skill id, matches its description, or asks which skills are available, the provider also appends a Mid-Conversation reminder with those skill ids, so Cursor models prefer `skill` / MCP over Grep/Shell ([issue #29](https://github.com/oakimov/cursor-opencode-provider/issues/29)). Classic OpenCode 1.x already puts MCP tools in the AI SDK catalog; only OpenCode 2 needs the direct-catalog transform above.
+
 No extra configuration is needed. Declare MCP servers in `opencode.json` as usual:
 
 ```json
@@ -127,7 +129,7 @@ No extra configuration is needed. Declare MCP servers in `opencode.json` as usua
 }
 ```
 
-`github` and `docs` leave `codemode` unset, so their tools join the direct catalog and Cursor calls them by name (for example `github_create_pull_request`). `executor` sets `"codemode": true` and stays inside `execute`. The plugin does not rewrite these entries.
+`github` and `docs` leave `codemode` unset, so their tools join the direct catalog and this provider can advertise them to Cursor (for example `github_create_pull_request` via GetDynamicTools / CallDynamicTool). `executor` sets `"codemode": true` and stays inside `execute`. The plugin does not rewrite these entries.
 
 Server names are normalized into tool namespaces (`my.docs` becomes `my_docs`). If names collide, an explicit `"codemode": true` prevents this plugin from moving that namespace. The `opencode` namespace is always left alone to preserve OpenCode's own tools; choose another MCP server name to use automatic direct placement.
 
