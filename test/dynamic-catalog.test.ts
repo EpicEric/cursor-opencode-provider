@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test"
 import {
   buildDynamicCatalogRoutingInstruction,
-  buildSkillCatalogNudge,
+  buildSkillCatalogChangeReminder,
+  takeSkillCatalogChangeReminder,
+  resetSkillCatalogAdmissionsForTests,
   listAdvertisedMcpServers,
   skillNameFromAgentSkill,
 } from "../src/context/dynamic-catalog.js"
@@ -85,6 +87,8 @@ describe("buildDynamicCatalogRoutingInstruction", () => {
     expect(line).toContain("including `skill` and MCP servers such as `context7`")
     expect(line).toContain("GetDynamicTools / CallDynamicTool")
     expect(line).toContain("before Grep/Shell fallbacks")
+    expect(line).toContain("Use the `skill` tool to load a skill when a task matches its description")
+    expect(line).toContain("does not need to be invoked again")
   })
 
   it("reports servers beyond the listed limit", () => {
@@ -98,185 +102,149 @@ describe("buildDynamicCatalogRoutingInstruction", () => {
   })
 })
 
-describe("buildSkillCatalogNudge", () => {
+describe("buildSkillCatalogChangeReminder", () => {
   const skills = [
     {
+      id: "ab-probe",
       full_path: "/repo/.opencode/skills/ab-probe/SKILL.md",
       description: "Returns the ab-probe marker token for issue 29 tests",
     },
     {
+      id: "firecrawl",
       full_path: "/repo/.opencode/skills/firecrawl/SKILL.md",
       description: "Search and scrape the web via Firecrawl",
     },
   ]
 
-  it("stays quiet without a skill tool or matching turn", () => {
+  it("stays quiet without a skill tool", () => {
     expect(
-      buildSkillCatalogNudge({
+      buildSkillCatalogChangeReminder({
         hasSkillTool: false,
         skills,
-        userText: "what is the ab-probe marker?",
-      }),
+        previousSkillIds: null,
+      }).text,
     ).toBeUndefined()
     expect(
-      buildSkillCatalogNudge({
-        hasSkillTool: true,
+      buildSkillCatalogChangeReminder({
+        hasSkillTool: false,
         skills,
-        userText: "refactor the parser",
-      }),
+        previousSkillIds: ["ab-probe"],
+      }).text,
     ).toBeUndefined()
   })
 
-  it("nudge matched skill ids through CallDynamicTool", () => {
-    const nudge = buildSkillCatalogNudge({
+  it("stays quiet on first admission (OpenCode baseline, not Mid-Conversation)", () => {
+    const result = buildSkillCatalogChangeReminder({
       hasSkillTool: true,
       skills,
-      userText: "what is the ab-probe marker?",
+      previousSkillIds: null,
       skillArgKey: "name",
     })
-    expect(nudge).toContain("<system_reminder>")
-    expect(nudge).toContain("`ab-probe`")
-    expect(nudge).toContain("GetDynamicTools / CallDynamicTool")
-    expect(nudge).toContain("tool `skill`")
-    expect(nudge).toContain('{ "name": "<skill-id>" }')
-    expect(nudge).toContain("host schema key is `name`")
-    expect(nudge).not.toContain("`firecrawl`")
+    expect(result.text).toBeUndefined()
+    expect(result.nextSkillIds).toEqual(["ab-probe", "firecrawl"])
   })
 
-  it("nudges OpenCode 2 skill calls with id", () => {
-    const nudge = buildSkillCatalogNudge({
+  it("stays quiet when the admitted catalog is unchanged", () => {
+    expect(
+      buildSkillCatalogChangeReminder({
+        hasSkillTool: true,
+        skills,
+        previousSkillIds: ["ab-probe", "firecrawl"],
+      }).text,
+    ).toBeUndefined()
+  })
+
+  it("emits an OpenCode-shaped supersede when the catalog grows", () => {
+    const result = buildSkillCatalogChangeReminder({
       hasSkillTool: true,
       skills,
-      userText: "what is the ab-probe marker?",
+      previousSkillIds: ["ab-probe"],
+      skillArgKey: "name",
+    })
+    expect(result.text).toContain("<system_reminder>")
+    expect(result.text).toContain("The available skills have changed")
+    expect(result.text).toContain("Use the skill tool to load a skill when a task matches its description")
+    expect(result.text).toContain("does not need to be invoked again")
+    expect(result.text).toContain("<available_skills>")
+    expect(result.text).toContain("<name>ab-probe</name>")
+    expect(result.text).toContain("<name>firecrawl</name>")
+    expect(result.text).toContain('{ "name": "<skill-id>" }')
+    expect(result.text).toContain("host schema key is `name`")
+    expect(result.text).not.toContain("Relevant skill id(s) this turn")
+    expect(result.nextSkillIds).toEqual(["ab-probe", "firecrawl"])
+  })
+
+  it("uses id in the OpenCode 2 call hint and skill entries", () => {
+    const result = buildSkillCatalogChangeReminder({
+      hasSkillTool: true,
+      skills,
+      previousSkillIds: [],
       skillArgKey: "id",
     })
-    expect(nudge).toContain('{ "id": "<skill-id>" }')
-    expect(nudge).toContain("host schema key is `id`")
+    expect(result.text).toContain('{ "id": "<skill-id>" }')
+    expect(result.text).toContain("<id>ab-probe</id>")
+    expect(result.text).toContain("host schema key is `id`")
   })
 
-  it("lists skills when the user explicitly asks about skills", () => {
-    const nudge = buildSkillCatalogNudge({
+  it("clears guidance when the catalog becomes empty after admission", () => {
+    const result = buildSkillCatalogChangeReminder({
+      hasSkillTool: true,
+      skills: [],
+      previousSkillIds: ["ab-probe"],
+    })
+    expect(result.text).toContain("Skill guidance is no longer available")
+    expect(result.nextSkillIds).toEqual([])
+  })
+})
+
+describe("takeSkillCatalogChangeReminder", () => {
+  const skills = [
+    {
+      id: "ocp-dev",
+      full_path: "/repo/.claude/skills/ocp-dev/SKILL.md",
+      description: "Wire OCP hosts for local development",
+    },
+  ]
+
+  it("admits once silently then stays quiet on identical catalogs", () => {
+    resetSkillCatalogAdmissionsForTests()
+    expect(
+      takeSkillCatalogChangeReminder("conv-a", {
+        hasSkillTool: true,
+        skills,
+        skillArgKey: "name",
+      }),
+    ).toBeUndefined()
+    expect(
+      takeSkillCatalogChangeReminder("conv-a", {
+        hasSkillTool: true,
+        skills,
+        skillArgKey: "name",
+      }),
+    ).toBeUndefined()
+  })
+
+  it("reminds only after the held catalog gains a skill", () => {
+    resetSkillCatalogAdmissionsForTests()
+    takeSkillCatalogChangeReminder("conv-b", {
       hasSkillTool: true,
       skills,
-      userText: "which skills are available?",
+      skillArgKey: "name",
     })
-    expect(nudge).toContain("`ab-probe`")
-    expect(nudge).toContain("`firecrawl`")
-  })
-
-  it("uses word boundaries for skill names", () => {
-    const nudge = buildSkillCatalogNudge({
-      hasSkillTool: true,
-      skills: [{ full_path: "/r/skills/plan/SKILL.md", description: "" }],
-      userText: "explain the planner",
-    })
-    expect(nudge).toBeUndefined()
-    expect(
-      buildSkillCatalogNudge({
-        hasSkillTool: true,
-        skills: [{ full_path: "/r/skills/plan/SKILL.md", description: "" }],
-        userText: "use plan, please",
-      }),
-    ).toContain("`plan`")
-  })
-
-  it("matches short description words", () => {
-    const nudge = buildSkillCatalogNudge({
-      hasSkillTool: true,
-      skills: [{ full_path: "/r/skills/cloud/SKILL.md", description: "AWS CLI helper" }],
-      userText: "how do I configure the aws cli profile?",
-    })
-    expect(nudge).toContain("`cloud`")
-  })
-
-  it("ignores incidental prose about skills", () => {
-    expect(
-      buildSkillCatalogNudge({
-        hasSkillTool: true,
-        skills,
-        userText: "the team has the skills to refactor this",
-      }),
-    ).toBeUndefined()
-  })
-
-  it("ignores MCP server-instruction dumps that would mass-match firecrawl skills", () => {
-    const firecrawlSkills = [
-      {
-        id: "find-skills",
-        full_path: "/r/skills/find-skills/SKILL.md",
-        description: "Find and install skills from the open agent skills ecosystem",
-      },
-      {
-        id: "firecrawl-build-search",
-        full_path: "/r/skills/firecrawl-build-search/SKILL.md",
-        description: "Search the web via Firecrawl tools and servers",
-      },
-      {
-        id: "firecrawl-build-scrape",
-        full_path: "/r/skills/firecrawl-build-scrape/SKILL.md",
-        description: "Scrape documentation and fetch library pages through Firecrawl tools",
-      },
-      {
-        id: "firecrawl-deep-research",
-        full_path: "/r/skills/firecrawl-deep-research/SKILL.md",
-        description: "Deep research using search tools and documentation servers",
-      },
-    ]
-    const mcpDump =
-      `<system-update>\nNew MCP server instructions are available:\n` +
-      `Use tools from this server through execute. Use this server to fetch current documentation ` +
-      `whenever the user asks about a library or framework. Prefer this over web search.\n</system-update>\n` +
-      `Workspace root: "/tmp/project".`
-    expect(
-      buildSkillCatalogNudge({
-        hasSkillTool: true,
-        skills: firecrawlSkills,
-        userText: mcpDump,
-      }),
-    ).toBeUndefined()
-  })
-
-  it("still matches when the user names a skill amid other text", () => {
-    expect(
-      buildSkillCatalogNudge({
-        hasSkillTool: true,
-        skills,
-        userText: "please use firecrawl for this research question",
-      }),
-    ).toContain("`firecrawl`")
-  })
-
-  it("treats hyphenated skill id segments as name hits", () => {
-    const nudge = buildSkillCatalogNudge({
+    const grown = takeSkillCatalogChangeReminder("conv-b", {
       hasSkillTool: true,
       skills: [
+        ...skills,
         {
-          id: "firecrawl-build-search",
-          full_path: "/r/skills/firecrawl-build-search/SKILL.md",
-          description: "Search the web via Firecrawl tools and servers",
-        },
-        {
-          id: "firecrawl-build-scrape",
-          full_path: "/r/skills/firecrawl-build-scrape/SKILL.md",
-          description: "Scrape documentation through Firecrawl tools",
-        },
-        {
-          id: "other-tooling",
-          full_path: "/r/skills/other-tooling/SKILL.md",
-          description: "Unrelated tooling helpers for servers and search tools",
+          id: "ab-probe",
+          full_path: "/repo/.opencode/skills/ab-probe/SKILL.md",
+          description: "marker",
         },
       ],
-      userText: "please use firecrawl for this research",
+      skillArgKey: "name",
     })
-    expect(nudge).toContain("`firecrawl-build-search`")
-    expect(nudge).toContain("`firecrawl-build-scrape`")
-    expect(nudge).not.toContain("`other-tooling`")
-  })
-
-  it("reports ids beyond the listed limit", () => {
-    const many = Array.from({ length: 10 }, (_, i) => ({ id: `s${i}`, full_path: `/r/skills/s${i}/SKILL.md` }))
-    const nudge = buildSkillCatalogNudge({ hasSkillTool: true, skills: many, userText: "list available skills" })
-    expect(nudge).toContain("`s7` (+2 more)")
-    expect(nudge).not.toContain("`s8`")
+    expect(grown).toContain("The available skills have changed")
+    expect(grown).toContain("<name>ab-probe</name>")
+    expect(grown).toContain("<name>ocp-dev</name>")
   })
 })

@@ -11,6 +11,11 @@ import {
   resetOverlayHoldsForTests,
   transferOverlayHold,
 } from "./overlay.js"
+import {
+  clearSkillCatalogAdmission,
+  resetSkillCatalogAdmissionsForTests,
+  transferSkillCatalogAdmission,
+} from "./dynamic-catalog.js"
 import { trace } from "../debug.js"
 import { encodeMessage } from "../protocol/messages.js"
 
@@ -57,6 +62,7 @@ function remember(conversationId: string, context: Record<string, unknown>): voi
     byConversationId.delete(oldest)
     materializedByConversationId.delete(oldest)
     clearOverlayHold(oldest)
+    clearSkillCatalogAdmission(oldest)
   }
 }
 
@@ -86,6 +92,7 @@ export function clearFrozenRequestContext(conversationId: string): void {
   byConversationId.delete(conversationId)
   materializedByConversationId.delete(conversationId)
   clearOverlayHold(conversationId)
+  clearSkillCatalogAdmission(conversationId)
   clearContextEpoch(conversationId)
 }
 
@@ -111,6 +118,7 @@ export function transferFrozenRequestContext(
   // also drops epoch state for each id.
   endContextEpoch(previousConversationId, nextConversationId)
   transferOverlayHold(previousConversationId, nextConversationId)
+  transferSkillCatalogAdmission(previousConversationId, nextConversationId)
   byConversationId.delete(previousConversationId)
   materializedByConversationId.delete(previousConversationId)
   byConversationId.delete(nextConversationId)
@@ -132,6 +140,7 @@ export function resetFrozenRequestContextsForTests(): void {
   materializedByConversationId.clear()
   buildsByConversationId.clear()
   resetOverlayHoldsForTests()
+  resetSkillCatalogAdmissionsForTests()
   resetContextEpochsForTests()
 }
 

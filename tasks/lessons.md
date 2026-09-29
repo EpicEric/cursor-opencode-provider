@@ -17,7 +17,10 @@
   Run is still waiting for the helper must not be treated as a fresh user
   turn. Cancelling the pending helper and reusing the parent conversation
   remints it (`interrupted-run`) and the model resumes lost. Isolate that
-  call when its catalog is a small subset of the busy parent's catalog.
+  call when its catalog is a small subset of the busy parent's catalog:
+  skip `preparePriorSessionForFreshTurn`, bind an ephemeral conversation, and
+  leave `openCodeSessionId` unset so `registerSession` cannot supersede the
+  held parent (self-verify L3: `task` trailing result after a 67-of-70 helper).
 - After plan approval, the agent-mode reminder has to say the plan-mode
   edit ban is over and that file changes go through `write` / `edit`. The
   older reminder says it supersedes other instructions, and the execution
@@ -406,13 +409,29 @@
   after discovery and includes them. Do not delay startup or the first Run to
   wait for MCP.
 
+## 2026-09-30 — Skill Mid-Conversation only on catalog change (OpenCode parity)
+
+- Per-turn `Relevant skill id(s) this turn` nudges re-loaded `ocp-dev` (and
+  firecrawl-*) whenever user text overlapped skill descriptions (`cursor` +
+  `provider`, self-verify paths, …). OpenCode 1 (`SystemPrompt.skills` /
+  `SkillGuidance`) and OpenCode 2 (`SkillInstructions`) never do that: the
+  catalog is baseline guidance; Mid-Conversation text fires only when the
+  available-skills list changes; OC2 also says a present `<skill_content>`
+  need not be invoked again.
+- Fix: drop userText matching. Admit the skill id set on first turn silently;
+  `takeSkillCatalogChangeReminder` emits an OpenCode-shaped supersede only
+  when the held catalog grows/shrinks. Frozen routing instruction carries the
+  load-when-matches + do-not-reinvoke lines.
+
 ## 2026-09-29 — Issue #29: Cursor dynamic catalog for skill / MCP
 
 - **Cursor cannot promote OpenCode `skill` / MCP to native top-level tools.**
   They stay on GetDynamicTools / CallDynamicTool (exec `mcp_args`). Agent-level
   prompt text alone is not enough; provider interaction guidance + Mid-
-  Conversation reminders carry more weight (issue #29 direction 3). Do not
-  chase directions 1–2 (top-level promotion) or invent a top-level catalog.
+  Conversation reminders on **catalog change** carry more weight (issue #29
+  direction 3). Do not chase directions 1–2 (top-level promotion) or invent a
+  top-level catalog. Do not per-turn nudge matched skill ids — OpenCode never
+  does that (baseline `<available_skills>` + change-only updates).
 - **OC2 direct-catalog placement is necessary but not sufficient.**
   `exposeDirectMcpTools` gets MCP into the AI SDK catalog so RequestContext can
   advertise them; Cursor models still call via the dynamic catalog. Classic
@@ -421,24 +440,18 @@
   server `apply`. Name only servers from merged `opencode.json` that own an
   advertised tool, using the same `resolveToolServerIdentity` as descriptors.
 - **Wire `AgentSkill` drops `id`.** Epoch-hold keeps ids in overlay memory;
-  nudges must read `getHeldOverlaySkills`, not RequestContext `agent_skills`
-  alone, or frontmatter-renamed skills break.
+  catalog-change reminders must read `getHeldOverlaySkills`, not RequestContext
+  `agent_skills` alone, or frontmatter-renamed skills break.
 - **Skill schema key differs by host major.** OpenCode 1.x requires `{name}`
   and rejects `id`; OpenCode 2.0 requires `{id}` and rejects `name`
   (`additionalProperties: false` strips the wrong key to `{}`). Put
   `skillArgKey` on `HostToolDialect`, detect from the advertised skill schema
-  when possible, and remap CallDynamicTool args to that key only. Nudge text
-  must name the live key — hard-coding `id` fails 1.18.
-- **Skill nudge must not score Mid-Conversation injections.** Match the live
-  user utterance only. MCP server-instruction dumps share tokens like
-  `search`/`tools`/`server` with firecrawl skill descriptions and will dump
-  dozens of ids every turn unless stripped/stopworded and description-only
-  mass matches are capped. Hyphenated skill id segments (`firecrawl-…`) still
-  count as name hits when the user says `firecrawl`.
-- **Gate the nudge on this turn’s permission, not the epoch advertisement.**
-  `allowTools && incomingTools` includes `skill`; a lifecycle/zero-tool turn
-  that re-advertises the frozen catalog must not ask for a call the host would
-  refuse.
+  when possible, and remap CallDynamicTool args to that key only. Change-
+  reminder text must name the live key — hard-coding `id` fails 1.18.
+- **Gate the change reminder on this turn’s permission, not the epoch
+  advertisement.** `allowTools && incomingTools` includes `skill`; a
+  lifecycle/zero-tool turn that re-advertises the frozen catalog must not ask
+  for a call the host would refuse.
 
 ## 2026-08-25 — Pricing gate before every release
 

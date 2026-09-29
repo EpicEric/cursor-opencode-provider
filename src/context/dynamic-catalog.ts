@@ -5,46 +5,29 @@ import { resolveToolServerIdentity } from "../protocol/tools.js"
  * top-level function list. Both OpenCode 1.x and OpenCode 2.0 reach the model
  * as MCP-shaped RequestContext ads, then GetDynamicTools / CallDynamicTool
  * (exec `mcp_args`). This module builds the shared routing guidance and the
- * skill-aware Mid-Conversation nudge used on both hosts.
+ * OpenCode-shaped Mid-Conversation skill-catalog update used on both hosts.
+ *
+ * OpenCode itself does **not** per-turn nudge matched skill ids. It:
+ * - Puts name/description guidance in the frozen baseline (`SystemPrompt.skills`
+ *   / `SkillGuidance` / `SkillInstructions`)
+ * - Emits a Mid-Conversation update only when the available-skills list changes
+ * - OpenCode 2: skips re-invoke when `<skill_content>` is already in the turn
  *
  * OpenCode 2 still needs `exposeDirectMcpTools` so MCP tools leave Code Mode
  * and enter the AI SDK catalog; without that step they never reach this
  * advertisement path at all.
  */
 
-const MAX_NAMED_SKILLS = 8
 const MAX_MCP_SERVERS_IN_GUIDANCE = 8
 /** Synthetic server builtins and unknown tools are advertised under (`toolsToMcpDescriptors`). */
 const DEFAULT_TOOL_SERVER = "opencode"
 
-/** Common words that carry no skill-matching signal. */
-const STOPWORDS = new Set([
-  "about", "all", "and", "any", "are", "but", "can", "for", "from", "has", "have",
-  "how", "into", "its", "not", "one", "only", "that", "the", "their", "them",
-  "then", "there", "these", "this", "use", "used", "uses", "using", "via", "was",
-  "what", "when", "which", "who", "why", "will", "with", "you", "your",
-  // Host/MCP instruction boilerplate — otherwise a server-instruction dump
-  // matches every firecrawl/search skill on "search"/"tools"/"server".
-  "tool", "tools", "server", "servers", "call", "calls", "fetch", "search",
-  "documentation", "library", "framework", "query", "please", "through",
-])
-
-/** An explicit question/request about skills, not incidental prose ("has the skills to"). */
-const SKILL_INQUIRY = /\b(?:which|what|list|show|available|any|use|using|call|invoke|load|run)\b[^.?!\n]{0,40}\bskills?\b|\bskills?\b[^.?!\n]{0,40}\b(?:available|installed|loaded|exist|do you have|can you)\b/i
-
-/** Description-only hits above this look like instruction-dump false positives. */
-const MAX_DESCRIPTION_ONLY_MATCHES = 2
-
 /**
- * Match against the live user utterance only. Mid-conversation / MCP instruction
- * injections and prior reminders must not re-trigger skill dumps.
+ * Skill ids already admitted to the model for a conversation (baseline RequestContext
+ * freeze, or the last Mid-Conversation catalog update). First admission is silent —
+ * OpenCode puts that list in the system baseline, not a per-turn reminder.
  */
-function skillMatchCorpus(userText: string): string {
-  return userText
-    .replace(/<system_reminder\b[^>]*>[\s\S]*?<\/system_reminder>/gi, " ")
-    .replace(/<system-update\b[^>]*>[\s\S]*?<\/system-update>/gi, " ")
-    .replace(/New MCP server instructions[\s\S]*?(?=\n[A-Z]|\n\n|$)/gi, " ")
-}
+const admittedSkillIdsByConversation = new Map<string, string[]>()
 
 export type AgentSkillLike = {
   /** OpenCode skill id (frontmatter `name`, else directory name). */
@@ -90,11 +73,30 @@ export function skillNameFromAgentSkill(skill: AgentSkillLike): string | undefin
   return parts.at(-2)
 }
 
+function skillIds(skills: readonly AgentSkillLike[]): string[] {
+  const ids: string[] = []
+  const seen = new Set<string>()
+  for (const skill of skills) {
+    const name = skillNameFromAgentSkill(skill)
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    ids.push(name)
+  }
+  return [...ids].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+}
+
+function sameIdList(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false
+  for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false
+  return true
+}
+
 /**
  * Shared system-guidance line: name advertised dynamic-catalog tools and prefer
  * them over Grep/Shell when skills or project rules apply. Concrete skill ids
- * are deliberately absent: this line is part of the frozen baseline system
- * context, and per-turn ids go through `buildSkillCatalogNudge` instead.
+ * stay out of the frozen baseline (they live in RequestContext `agent_skills`
+ * and in Mid-Conversation updates when the catalog changes — same split as
+ * OpenCode's SkillGuidance / SkillInstructions).
  */
 export function buildDynamicCatalogRoutingInstruction(options: {
   toolNames: Iterable<string>
@@ -111,109 +113,162 @@ export function buildDynamicCatalogRoutingInstruction(options: {
     extras.push(`MCP servers such as ${listWithOverflow(mcpServers, MAX_MCP_SERVERS_IN_GUIDANCE)}`)
   }
 
-  return (
+  const lines = [
     `- OpenCode host tools that are not in Cursor's native top-level list (including ${extras.join(" and ")}) ` +
-    "are reached through GetDynamicTools / CallDynamicTool (or the host's equivalent dynamic catalog). " +
-    "When a skill matches or project rules name an MCP server, discover and call those tools that way " +
-    "before Grep/Shell fallbacks. Do not narrate that they are unavailable."
-  )
-}
-
-function wordTokens(text: string): Set<string> {
-  return new Set(
-    text
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .filter((token) => token.length >= 3 && !STOPWORDS.has(token)),
-  )
-}
-
-function descriptionMatchesUserText(description: string, userTokens: ReadonlySet<string>): boolean {
-  let hits = 0
-  let distinctive = false
-  for (const token of wordTokens(description)) {
-    if (!userTokens.has(token)) continue
-    hits += 1
-    if (token.length >= 8) distinctive = true
-    if (hits >= 2) return true
+      "are reached through GetDynamicTools / CallDynamicTool (or the host's equivalent dynamic catalog). " +
+      "When a skill matches or project rules name an MCP server, discover and call those tools that way " +
+      "before Grep/Shell fallbacks. Do not narrate that they are unavailable.",
+  ]
+  if (hasSkill) {
+    // Mirror OpenCode 1 SystemPrompt.skills / OC2 SkillInstructions.render.
+    lines.push(
+      "- Skills provide specialized instructions and workflows for specific tasks. " +
+        "Use the `skill` tool to load a skill when a task matches its description " +
+        "(RequestContext `agent_skills` lists names and descriptions). " +
+        "A skill that is already present in the conversation as a `<skill_content>` block " +
+        "does not need to be invoked again.",
+    )
   }
-  // Single distinctive token (library names, skill ids) is enough.
-  return distinctive
+  return lines.join("\n")
 }
 
-function nameMatchesUserText(name: string, userText: string): boolean {
-  const haystack = userText.toLowerCase()
-  const candidates = [name.toLowerCase(), ...name.toLowerCase().split(/[-_]+/).filter((part) => part.length >= 5)]
-  for (const candidate of [...new Set(candidates)]) {
-    const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    if (new RegExp(`(?<![a-z0-9_-])${escaped}(?![a-z0-9_-])`).test(haystack)) return true
+function skillEntriesXml(skills: readonly AgentSkillLike[], argKey: "name" | "id"): string[] {
+  const lines: string[] = ["<available_skills>"]
+  for (const skill of skills) {
+    const name = skillNameFromAgentSkill(skill)
+    if (!name) continue
+    const description = typeof skill.description === "string" ? skill.description : ""
+    lines.push("  <skill>")
+    if (argKey === "id") lines.push(`    <id>${name}</id>`)
+    lines.push(`    <name>${name}</name>`)
+    if (description) lines.push(`    <description>${description}</description>`)
+    lines.push("  </skill>")
   }
-  return false
+  lines.push("</available_skills>")
+  return lines
 }
 
 /**
- * Mid-Conversation nudge after RequestContext skills are known. Prefer skills
- * that match the user turn; otherwise stay quiet unless the user asked about
- * skills explicitly (avoids dumping dozens of firecrawl-* ids every turn).
- * `hasSkillTool` must reflect what the host permits this turn, not the
- * epoch-held advertisement.
+ * OpenCode-shaped Mid-Conversation skill update.
+ *
+ * Pure: compare `previousSkillIds` (null = not yet admitted this conversation)
+ * to the current catalog. First admission returns undefined — baseline
+ * RequestContext + routing instruction already carry the list. Later turns
+ * only speak when the id set changes (agent switch / discovery growth), matching
+ * `SkillGuidance.update` / `SkillInstructions.update`.
  */
-export function buildSkillCatalogNudge(options: {
+export function buildSkillCatalogChangeReminder(options: {
   hasSkillTool: boolean
   skills: readonly AgentSkillLike[]
-  userText?: string
+  /** Sorted skill ids already admitted; `null` means first admission this conversation. */
+  previousSkillIds: readonly string[] | null
   /**
    * Host skill parameter key from the advertised schema.
    * OpenCode 1.x: `name`. OpenCode 2.0: `id`.
    */
   skillArgKey?: "name" | "id"
+}): { text: string | undefined; nextSkillIds: string[] } {
+  const nextSkillIds = skillIds(options.skills)
+  if (!options.hasSkillTool) {
+    return { text: undefined, nextSkillIds: options.previousSkillIds ? [...options.previousSkillIds] : [] }
+  }
+  if (options.previousSkillIds === null) {
+    return { text: undefined, nextSkillIds }
+  }
+  if (sameIdList(options.previousSkillIds, nextSkillIds)) {
+    return { text: undefined, nextSkillIds }
+  }
+
+  const argKey = options.skillArgKey === "id" ? "id" : "name"
+  const callHint = argKey === "id"
+    ? "Call `skill` with `{ \"id\": \"<skill-id>\" }` (host schema key is `id`)."
+    : "Call `skill` with `{ \"name\": \"<skill-id>\" }` (host schema key is `name`)."
+
+  const body = nextSkillIds.length === 0
+    ? ["Skill guidance is no longer available. Do not use any previously listed skill."]
+    : [
+        "The available skills have changed. This list supersedes the previous available skills list.",
+        "Skills provide specialized instructions and workflows for specific tasks.",
+        "Use the skill tool to load a skill when a task matches its description.",
+        "The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.",
+        `OpenCode skills are invoked with the host \`skill\` tool through GetDynamicTools / CallDynamicTool (MCP server \`${DEFAULT_TOOL_SERVER}\`, tool \`skill\`), not by Grep/Read of SKILL.md. ${callHint}`,
+        ...skillEntriesXml(options.skills, argKey),
+      ]
+
+  return {
+    text: `<system_reminder>\n${body.join("\n")}\n</system_reminder>`,
+    nextSkillIds,
+  }
+}
+
+/**
+ * Admit the current skill catalog for a conversation and return a Mid-Conversation
+ * reminder only when OpenCode would (catalog changed after baseline admission).
+ */
+export function takeSkillCatalogChangeReminder(
+  conversationId: string,
+  options: {
+    hasSkillTool: boolean
+    skills: readonly AgentSkillLike[]
+    skillArgKey?: "name" | "id"
+  },
+): string | undefined {
+  const previous = conversationId
+    ? (admittedSkillIdsByConversation.get(conversationId) ?? null)
+    : null
+  const { text, nextSkillIds } = buildSkillCatalogChangeReminder({
+    ...options,
+    previousSkillIds: previous,
+  })
+  if (!conversationId) return text
+  if (!options.hasSkillTool && previous === null && nextSkillIds.length === 0) {
+    return text
+  }
+  admittedSkillIdsByConversation.delete(conversationId)
+  admittedSkillIdsByConversation.set(conversationId, nextSkillIds)
+  while (admittedSkillIdsByConversation.size > 256) {
+    const oldest = admittedSkillIdsByConversation.keys().next().value as string | undefined
+    if (!oldest) break
+    admittedSkillIdsByConversation.delete(oldest)
+  }
+  return text
+}
+
+export function clearSkillCatalogAdmission(conversationId: string): void {
+  admittedSkillIdsByConversation.delete(conversationId)
+}
+
+export function transferSkillCatalogAdmission(
+  previousConversationId: string,
+  nextConversationId: string,
+): void {
+  if (!previousConversationId || !nextConversationId) return
+  const prior = admittedSkillIdsByConversation.get(previousConversationId)
+  admittedSkillIdsByConversation.delete(previousConversationId)
+  admittedSkillIdsByConversation.delete(nextConversationId)
+  if (prior) admittedSkillIdsByConversation.set(nextConversationId, prior)
+}
+
+export function resetSkillCatalogAdmissionsForTests(): void {
+  admittedSkillIdsByConversation.clear()
+}
+
+/**
+ * @deprecated Prefer `buildSkillCatalogChangeReminder` / `takeSkillCatalogChangeReminder`.
+ * Kept as a thin alias for callers that still expect the old name; always returns
+ * undefined for userText-based matching (OpenCode never did per-turn id nudges).
+ */
+export function buildSkillCatalogNudge(options: {
+  hasSkillTool: boolean
+  skills: readonly AgentSkillLike[]
+  userText?: string
+  skillArgKey?: "name" | "id"
+  previousSkillIds?: readonly string[] | null
 }): string | undefined {
-  if (!options.hasSkillTool || options.skills.length === 0) return undefined
-  const userText = skillMatchCorpus(options.userText ?? "")
-  const userTokens = wordTokens(userText)
-  const skillInquiry = SKILL_INQUIRY.test(userText)
-
-  const named = options.skills
-    .map((skill) => {
-      const name = skillNameFromAgentSkill(skill)
-      if (!name) return undefined
-      const description = typeof skill.description === "string" ? skill.description : ""
-      const nameHit = nameMatchesUserText(name, userText)
-      const descHit = !!description && descriptionMatchesUserText(description, userTokens)
-      return { name, nameHit, descHit }
-    })
-    .filter((row): row is { name: string; nameHit: boolean; descHit: boolean } => !!row)
-
-  if (named.length === 0) return undefined
-
-  const nameMatched = named.filter((row) => row.nameHit)
-  const descOnly = named.filter((row) => row.descHit && !row.nameHit)
-  // Mass description-only hits are almost always instruction-dump noise
-  // (MCP server blurbs sharing "search"/"tools" with firecrawl skills).
-  const descMatched = descOnly.length <= MAX_DESCRIPTION_ONLY_MATCHES ? descOnly : []
-
-  const selected = nameMatched.length > 0
-    ? [...nameMatched, ...descMatched]
-    : skillInquiry
-      ? named
-      : descMatched
-  if (selected.length === 0) return undefined
-
-  const ids = [...new Set(selected.map((row) => row.name))]
-  // Prefer the advertised schema key; fall back to naming both so a stale
-  // Mid-Conversation hint cannot contradict GetDynamicTools on either host.
-  const argKey = options.skillArgKey
-  const callHint = argKey
-    ? `Call \`skill\` with \`{ "${argKey}": "<skill-id>" }\` (host schema key is \`${argKey}\`) `
-    : "Call `skill` with the skill identifier using the parameter key from GetDynamicTools " +
-      "(`name` on OpenCode 1.x, `id` on OpenCode 2.0) "
-  return (
-    "<system_reminder>\n" +
-    "OpenCode skills are invoked with the host `skill` tool through GetDynamicTools / CallDynamicTool " +
-    `(MCP server \`${DEFAULT_TOOL_SERVER}\`, tool \`skill\`), not by Grep/Read of SKILL.md. ` +
-    `Relevant skill id(s) this turn: ${listWithOverflow(ids, MAX_NAMED_SKILLS)}. ` +
-    callHint +
-    "before answering from memory or falling back to shell/search tools.\n" +
-    "</system_reminder>"
-  )
+  return buildSkillCatalogChangeReminder({
+    hasSkillTool: options.hasSkillTool,
+    skills: options.skills,
+    previousSkillIds: options.previousSkillIds ?? null,
+    skillArgKey: options.skillArgKey,
+  }).text
 }

@@ -4,7 +4,9 @@ import {
   cancelPendingExecsForFreshTurn,
   drainSessionUntilTurnEnded,
   FRESH_TURN_PENDING_CANCEL_REASON,
+  isProperCatalogSubset,
   preparePriorSessionForFreshTurn,
+  shouldIsolateInSessionHelper,
 } from "../src/language-model.js"
 import { sessionManager, type CursorSession } from "../src/session.js"
 
@@ -157,5 +159,73 @@ describe("fresh-turn prior drain", () => {
     expect(session.closed).toBe(false)
     resolveNext?.({ done: true, value: undefined })
     sessionManager.close(session, "ordinary-cleanup")
+  })
+})
+
+describe("in-session helper catalog isolation", () => {
+  it("detects a proper catalog subset (67 of 70, missing task/question/plan_exit)", () => {
+    const parent = ["bash", "edit", "grep", "plan_exit", "question", "read", "task", "write"].map(
+      (name) => ({ name }),
+    )
+    const helper = parent.filter((tool) => !["plan_exit", "question", "task"].includes(tool.name))
+    expect(isProperCatalogSubset(helper, parent)).toBe(true)
+    expect(isProperCatalogSubset(parent, parent)).toBe(false)
+    expect(isProperCatalogSubset(parent, helper)).toBe(false)
+    expect(isProperCatalogSubset([{ name: "other" }], parent)).toBe(false)
+    expect(isProperCatalogSubset([], parent)).toBe(false)
+  })
+
+  it("isolates when a busy parent Run is open with a larger catalog", () => {
+    const parent = fakeSessionWithPayloads([])
+    parent.toolCatalog = [
+      { name: "bash" },
+      { name: "read" },
+      { name: "task" },
+      { name: "question" },
+      { name: "plan_exit" },
+      { name: "write" },
+    ] as never
+    sessionManager.registerPending(37, parent, "mcp_result", "task", false)
+
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, [
+      { name: "bash" },
+      { name: "read" },
+      { name: "write" },
+    ])).toBe(true)
+
+    // Same-sized catalog is a real fresh turn, not a helper.
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, parent.toolCatalog!)).toBe(false)
+    // Different OpenCode session id is a real child agent, not this path.
+    expect(shouldIsolateInSessionHelper("ses_other_child", [
+      { name: "bash" },
+      { name: "read" },
+    ])).toBe(false)
+
+    sessionManager.close(parent, "ordinary-cleanup")
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, [
+      { name: "bash" },
+      { name: "read" },
+    ])).toBe(false)
+  })
+
+  it("does not cancel the parent pending when the helper should be isolated", async () => {
+    const parent = fakeSessionWithPayloads([turnEndedPayload(100, 80)])
+    parent.toolCatalog = Array.from({ length: 70 }, (_, index) => ({
+      name: index === 37 ? "task" : `tool-${index}`,
+    })) as never
+    sessionManager.registerPending(37, parent, "mcp_result", "task", false)
+
+    const helperTools = (parent.toolCatalog ?? []).filter((tool) => tool.name !== "task")
+    expect(shouldIsolateInSessionHelper(parent.openCodeSessionId, helperTools)).toBe(true)
+    // Isolation skips preparePriorSessionForFreshTurn entirely — parent pending stays.
+    expect(parent.pending.size).toBe(1)
+    expect(parent.closed).toBe(false)
+
+    // A non-isolated fresh turn still cancels + drains as before.
+    expect(await preparePriorSessionForFreshTurn(parent.openCodeSessionId, {
+      timeoutMs: 1_000,
+    })).toBe("drained")
+    expect(parent.pending.size).toBe(0)
+    expect(parent.closed).toBe(true)
   })
 })
