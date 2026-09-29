@@ -724,6 +724,12 @@ async function doStreamImpl(
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
   const trailingToolResults = extractTrailingToolResults(prompt)
+  // A host may submit an already rendered plan through its canonical stage
+  // tool after the Cursor Run has ended. The next call carries that tool result
+  // without a Cursor exec id; reconcile the approved mode before a fresh Run.
+  if (hasApprovedUncorrelatedPlanStageResult(prompt)) {
+    setActiveCursorMode(opencodeSessionKey(callOptions), "agent")
+  }
   let session = findContinuationSession(trailingToolResults)
 
   if (session) {
@@ -2209,6 +2215,16 @@ export function deliverContinuationResults(
         })
       }
     }
+    // A directly called advertised plan-stage tool can own the same review
+    // gate as a bridged CreatePlan. Its successful result means execution was
+    // approved, so the next Run must carry agent-mode guidance.
+    if (
+      !pending.bridged
+      && pending.toolName === CURSOR_PLAN_STAGE_TOOL
+      && r.error === undefined
+    ) {
+      setActiveCursorMode(session.openCodeSessionId, "agent")
+    }
     // A host `todoread` result is the authoritative list. Refresh the mirrored
     // snapshot (direct reads and bridged native reads alike) so later merges
     // apply onto host truth, not a stale write.
@@ -3364,7 +3380,7 @@ export async function pump(
               imageId = stageCursorImage({
                 path: target,
                 projectDir,
-                mime: imageMimeForPath(target),
+                mime: imageMimeForPath(target, binaryWrite.data),
                 data: binaryWrite.data,
                 sessionId: session.openCodeSessionId,
               })
@@ -3871,6 +3887,24 @@ export function extractTrailingToolResults(
   // means this is a fresh model call that merely carries tools in history.
   if (i === prompt.length - 1) return []
   return extractToolResults(prompt.slice(i + 1))
+}
+
+/** Detect a host-owned canonical plan review, excluding Cursor exec replies. */
+export function hasApprovedUncorrelatedPlanStageResult(
+  prompt: LanguageModelV3CallOptions["prompt"],
+): boolean {
+  if (prompt.length === 0 || prompt[prompt.length - 1].role !== "tool") return false
+  for (let i = prompt.length - 1; i >= 0 && prompt[i].role === "tool"; i--) {
+    const message = prompt[i]
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (part.type !== "tool-result" || part.toolName !== CURSOR_PLAN_STAGE_TOOL) continue
+      if (parseExecIdFromToolCallId(part.toolCallId)) continue
+      const result = toolResultOutputToText(part.output)
+      return !result.isError
+    }
+  }
+  return false
 }
 
 function toolResultOutputToText(output: unknown): { text: string; isError: boolean } {

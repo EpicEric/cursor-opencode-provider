@@ -3,10 +3,11 @@ import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
-import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, rememberMirroredTodos, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
+import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
 import { decodeMessage } from "../src/protocol/messages.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
+import { getActiveCursorMode, setActiveCursorMode } from "../src/protocol/switch-mode.js"
 import {
   captureCursorShellResult,
   registerCursorShellCall,
@@ -91,6 +92,19 @@ describe("findContinuationSession", () => {
 })
 
 describe("extractTrailingToolResults", () => {
+  it("recognizes an approved host-owned canonical stage result only at the live tail", () => {
+    const stage = (type: "text" | "error-text", id = "host_plan_stage_review") => ({
+      role: "tool", content: [{ type: "tool-result", toolCallId: id,
+        toolName: "cursor_plan_stage", output: { type, value: "review result" } }],
+    }) as LanguageModelV3CallOptions["prompt"][number]
+    expect(hasApprovedUncorrelatedPlanStageResult([stage("text")])).toBe(true)
+    expect(hasApprovedUncorrelatedPlanStageResult([stage("error-text")])).toBe(false)
+    expect(hasApprovedUncorrelatedPlanStageResult([stage("text"), stage("error-text")])).toBe(false)
+    expect(hasApprovedUncorrelatedPlanStageResult([stage("text", "cursor_live_8")])).toBe(false)
+    expect(hasApprovedUncorrelatedPlanStageResult([stage("text"),
+      { role: "user", content: [{ type: "text", text: "new request" }] }])).toBe(false)
+  })
+
   it("returns only tool results after the last non-tool message", () => {
     const prompt = [
       { role: "user", content: [{ type: "text", text: "hi" }] },
@@ -155,6 +169,25 @@ describe("extractTrailingToolResults", () => {
 })
 
 describe("deliverContinuationResults", () => {
+  it("leaves provider plan mode after a directly called stage tool succeeds", () => {
+    const live = fakeSession("direct-stage")
+    live.openCodeSessionId = "host-direct-stage"
+    setActiveCursorMode(live.openCodeSessionId, "plan")
+    sessionManager.registerPending(8, live, "mcp_result", "cursor_plan_stage")
+
+    expect(deliverContinuationResults(live, [{
+      sessionId: live.sessionId, execId: 8, toolName: "cursor_plan_stage", output: "Plan approved",
+    }])).toBe(live)
+    expect(getActiveCursorMode(live.openCodeSessionId)).toBe("agent")
+
+    setActiveCursorMode(live.openCodeSessionId, "plan")
+    sessionManager.registerPending(9, live, "mcp_result", "cursor_plan_stage")
+    expect(deliverContinuationResults(live, [{
+      sessionId: live.sessionId, execId: 9, toolName: "cursor_plan_stage", output: "", error: "Keep planning",
+    }])).toBe(live)
+    expect(getActiveCursorMode(live.openCodeSessionId)).toBe("plan")
+  })
+
   it("writes pending exec results and keeps the live session", () => {
     const writes: Uint8Array[] = []
     const live = fakeSession("live-write")

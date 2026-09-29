@@ -49,7 +49,14 @@ export const STAGED_IMAGE_TTL_MS = 10 * 60_000
 /** Bounds memory if a turn generates several images and none are committed. */
 const MAX_PENDING = 8
 
-const pending = new Map<string, PendingCursorImage>()
+// Some hosts load the model and the image-save subpath in separate module
+// graphs. Keep the one-use handles in the process registry so both graphs see
+// the same staged bytes. The UUID handle remains the only tool input.
+const PENDING_IMAGES = Symbol.for("cursor-opencode-provider.pending-images")
+const globals = globalThis as typeof globalThis & {
+  [PENDING_IMAGES]?: Map<string, PendingCursorImage>
+}
+const pending = globals[PENDING_IMAGES] ??= new Map<string, PendingCursorImage>()
 
 export class StagedImageTooLargeError extends Error {
   constructor(bytes: number) {

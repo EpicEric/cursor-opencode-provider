@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { handleInteractionQuery } from "../src/protocol/interactions.js"
 import {
@@ -209,15 +210,15 @@ describe("pending image staging", () => {
 describe("cursor_image_save is not a general file writer", () => {
   it("writes nothing for an id it never issued", async () => {
     const { ctx, calls } = askRecorder()
-    expect(typeof await executeCursorImageSave({ image_id: "cursor-image-made-up" }, ctx))
-      .toBe("string")
+    await expect(executeCursorImageSave({ image_id: "cursor-image-made-up" }, ctx))
+      .rejects.toThrow("No pending Cursor image")
     expect(calls).toHaveLength(0)
     expect(fs.readdirSync(workspace)).toHaveLength(0)
   })
 
   it("writes nothing when no id is supplied", async () => {
     const { ctx, calls } = askRecorder()
-    expect(typeof await executeCursorImageSave({}, ctx)).toBe("string")
+    await expect(executeCursorImageSave({}, ctx)).rejects.toThrow("No image id")
     expect(calls).toHaveLength(0)
   })
 
@@ -225,7 +226,31 @@ describe("cursor_image_save is not a general file writer", () => {
     const { ctx } = askRecorder()
     const id = stage(path.join(projectDir, "assets", "a.png"))
     expect(typeof await executeCursorImageSave({ image_id: id }, ctx)).toBe("object")
-    expect(typeof await executeCursorImageSave({ image_id: id }, ctx)).toBe("string")
+    await expect(executeCursorImageSave({ image_id: id }, ctx))
+      .rejects.toThrow("No pending Cursor image")
+  })
+
+  it("commits an image staged by a separately loaded provider module graph", async () => {
+    const graphDir = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-image-graph-"))
+    try {
+      const copy = path.join(graphDir, "image-staging.ts")
+      fs.copyFileSync(path.join(import.meta.dir, "../src/image-staging.ts"), copy)
+      const otherGraph = await import(pathToFileURL(copy).href)
+      expect(otherGraph.stageCursorImage).not.toBe(stageCursorImage)
+      const target = path.join(projectDir, "assets", "separate-graph.png")
+      const id = otherGraph.stageCursorImage({
+        path: target,
+        projectDir,
+        mime: "image/png",
+        data: PNG,
+      })
+      const { ctx } = askRecorder()
+      await executeCursorImageSave({ image_id: id }, ctx)
+      expect(fs.readFileSync(target)).toEqual(Buffer.from(PNG))
+      expect(otherGraph.pendingCursorImageCount()).toBe(0)
+    } finally {
+      fs.rmSync(graphDir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -262,7 +287,7 @@ describe("containment across both write roots", () => {
   it("does not ask for permission on a path it cannot honour", async () => {
     const { ctx, calls } = askRecorder()
     const id = stage(path.join(os.tmpdir(), "cursor-image-neither", "a.png"))
-    expect(await executeCursorImageSave({ image_id: id }, ctx)).toContain("outside")
+    await expect(executeCursorImageSave({ image_id: id }, ctx)).rejects.toThrow("outside")
     expect(calls).toHaveLength(0)
   })
 })
@@ -368,6 +393,14 @@ describe("generate image protocol", () => {
     expect(imageMimeForPath("a.jpg")).toBe("image/jpeg")
     expect(imageMimeForPath("a.WEBP")).toBe("image/webp")
     expect(imageMimeForPath("a")).toBe("image/png")
+  })
+
+  it("uses the encoded image type when Cursor's target extension disagrees", () => {
+    expect(imageMimeForPath("a.png", Uint8Array.from([0xff, 0xd8, 0xff, 0xe0]))).toBe("image/jpeg")
+    expect(imageMimeForPath("a.jpg", PNG)).toBe("image/png")
+    expect(imageMimeForPath("a.png", new TextEncoder().encode("GIF89a"))).toBe("image/gif")
+    expect(imageMimeForPath("a.png", new TextEncoder().encode("RIFF1234WEBP"))).toBe("image/webp")
+    expect(imageMimeForPath("a.jpg", Uint8Array.from([0xff]))).toBe("image/jpeg")
   })
 
   it("round-trips Cursor's permission_denied write result", () => {
