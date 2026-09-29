@@ -93,6 +93,12 @@ export const CURSOR_MODEL_COSTS = {
     "cache_read": 0.2,
     "cache_write": 2.5
   },
+  "claude-sonnet-5-5": {
+    "input": 2,
+    "output": 10,
+    "cache_read": 0.2,
+    "cache_write": 2.5
+  },
   "composer-2.5": {
     "input": 0.5,
     "output": 2.5,
@@ -142,6 +148,16 @@ export const CURSOR_MODEL_COSTS = {
     "input": 1.4,
     "output": 4.4,
     "cache_read": 0.26
+  },
+  "glm-5.3": {
+    "input": 1.4,
+    "output": 4.4,
+    "cache_read": 0.26
+  },
+  "glm-5.3-flash": {
+    "input": 0.15,
+    "output": 0.5,
+    "cache_read": 0.029
   },
   "gpt-5-mini": {
     "input": 0.25,
@@ -338,6 +354,10 @@ export const CURSOR_MODEL_CONTEXTS = {
     "maxContext": 200000,
     "maxContextForMaxMode": 1000000
   },
+  "claude-sonnet-5-5": {
+    "maxContext": 200000,
+    "maxContextForMaxMode": 1000000
+  },
   "composer-2.5": {
     "maxContext": 200000
   },
@@ -371,6 +391,12 @@ export const CURSOR_MODEL_CONTEXTS = {
   },
   "glm-5.2": {
     "maxContext": 200000
+  },
+  "glm-5.3": {
+    "maxContext": 1000000
+  },
+  "glm-5.3-flash": {
+    "maxContext": 1000000
   },
   "gpt-5-mini": {
     "maxContext": 272000
@@ -473,6 +499,9 @@ export const CURSOR_MODEL_CAPABILITIES = {
   "claude-sonnet-5": {
     "supportsImages": true
   },
+  "claude-sonnet-5-5": {
+    "supportsImages": true
+  },
   "composer-2.5": {
     "supportsImages": true
   },
@@ -499,6 +528,12 @@ export const CURSOR_MODEL_CAPABILITIES = {
   },
   "glm-5.2": {
     "supportsImages": false
+  },
+  "glm-5.3": {
+    "supportsImages": false
+  },
+  "glm-5.3-flash": {
+    "supportsImages": true
   },
   "gpt-5-mini": {
     "supportsImages": true

@@ -67,6 +67,7 @@ const DISPLAY_NAME_TO_MODEL_ID: Record<string, string> = {
   "Claude Opus 5": "claude-opus-5",
   "Claude Opus 5.5": "claude-opus-5-5",
   "Claude Sonnet 5": "claude-sonnet-5",
+  "Claude Sonnet 5.5": "claude-sonnet-5-5",
   "Composer 2.5": "composer-2.5",
   "Gemini 2.5 Flash": "gemini-2.5-flash",
   "Gemini 3 Flash": "gemini-3-flash",
@@ -76,6 +77,8 @@ const DISPLAY_NAME_TO_MODEL_ID: Record<string, string> = {
   "Gemini 3.7 Flash": "gemini-3.7-flash",
   "Gemini 3.8 Flash": "gemini-3.8-flash",
   "GLM 5.2": "glm-5.2",
+  "GLM 5.3": "glm-5.3",
+  "GLM 5.3 Flash": "glm-5.3-flash",
   "GPT-5 Mini": "gpt-5-mini",
   // Cursor lists Codex-branded GPT-5.1 rows; our AvailableModels id is gpt-5.1.
   "GPT-5.1 Codex": "gpt-5.1",
