@@ -406,6 +406,40 @@
   after discovery and includes them. Do not delay startup or the first Run to
   wait for MCP.
 
+## 2026-09-29 — Issue #29: Cursor dynamic catalog for skill / MCP
+
+- **Cursor cannot promote OpenCode `skill` / MCP to native top-level tools.**
+  They stay on GetDynamicTools / CallDynamicTool (exec `mcp_args`). Agent-level
+  prompt text alone is not enough; provider interaction guidance + Mid-
+  Conversation reminders carry more weight (issue #29 direction 3). Do not
+  chase directions 1–2 (top-level promotion) or invent a top-level catalog.
+- **OC2 direct-catalog placement is necessary but not sufficient.**
+  `exposeDirectMcpTools` gets MCP into the AI SDK catalog so RequestContext can
+  advertise them; Cursor models still call via the dynamic catalog. Classic
+  1.x already puts MCP in that catalog.
+- **Never infer MCP servers from underscore prefixes.** `apply_patch` is not
+  server `apply`. Name only servers from merged `opencode.json` that own an
+  advertised tool, using the same `resolveToolServerIdentity` as descriptors.
+- **Wire `AgentSkill` drops `id`.** Epoch-hold keeps ids in overlay memory;
+  nudges must read `getHeldOverlaySkills`, not RequestContext `agent_skills`
+  alone, or frontmatter-renamed skills break.
+- **Skill schema key differs by host major.** OpenCode 1.x requires `{name}`
+  and rejects `id`; OpenCode 2.0 requires `{id}` and rejects `name`
+  (`additionalProperties: false` strips the wrong key to `{}`). Put
+  `skillArgKey` on `HostToolDialect`, detect from the advertised skill schema
+  when possible, and remap CallDynamicTool args to that key only. Nudge text
+  must name the live key — hard-coding `id` fails 1.18.
+- **Skill nudge must not score Mid-Conversation injections.** Match the live
+  user utterance only. MCP server-instruction dumps share tokens like
+  `search`/`tools`/`server` with firecrawl skill descriptions and will dump
+  dozens of ids every turn unless stripped/stopworded and description-only
+  mass matches are capped. Hyphenated skill id segments (`firecrawl-…`) still
+  count as name hits when the user says `firecrawl`.
+- **Gate the nudge on this turn’s permission, not the epoch advertisement.**
+  `allowTools && incomingTools` includes `skill`; a lifecycle/zero-tool turn
+  that re-advertises the frozen catalog must not ask for a call the host would
+  refuse.
+
 ## 2026-08-25 — Pricing gate before every release
 
 - **CI regenerating pricing is a backstop, not permission to skip the local
