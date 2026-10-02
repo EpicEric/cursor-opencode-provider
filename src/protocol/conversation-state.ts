@@ -15,6 +15,12 @@ import {
 import { getCheckpoint, setCheckpoint } from "./checkpoint.js"
 import type { OpencodeToolDef } from "./tools.js"
 import {
+  getTurnProvenance,
+  parseTurnProvenance,
+  restoreTurnProvenance,
+  serializeTurnProvenance,
+} from "./turn-provenance.js"
+import {
   deletePersistedConversation,
   loadPersistedConversation,
   persistConversation,
@@ -46,6 +52,8 @@ export async function hydrateConversationState(
   if (persisted.checkpoint) setCheckpoint(persisted.conversationId, persisted.checkpoint)
   restoreConversationBlobs(persisted.conversationId, persisted.blobs)
   setFrozenRequestContext(persisted.conversationId, persisted.requestContext)
+  const provenance = persisted.turnProvenance ? parseTurnProvenance(persisted.turnProvenance) : undefined
+  if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
   trace(
     `conversation persistence: restored sessionKey=${sessionKey} ` +
       `conversationId=${persisted.conversationId} checkpoint=${persisted.checkpoint?.length ?? 0}B ` +
@@ -58,6 +66,15 @@ export async function hydrateConversationState(
     ...(persisted.hostAgent ? { hostAgent: persisted.hostAgent } : {}),
     ...(persisted.systemPromptHash ? { systemPromptHash: persisted.systemPromptHash } : {}),
   }
+}
+
+/** Restore only turn provenance when its in-memory entry was evicted. */
+export async function hydrateTurnProvenance(cacheDir: string, sessionKey: string): Promise<void> {
+  if (getTurnProvenance(sessionKey)) return
+  const persisted = (await loadPersistedConversation(cacheDir, sessionKey)).value
+  if (!persisted?.turnProvenance) return
+  const provenance = parseTurnProvenance(persisted.turnProvenance)
+  if (provenance?.conversationId === persisted.conversationId) restoreTurnProvenance(sessionKey, provenance)
 }
 
 /** Persist the complete resumable state only after Cursor confirms TurnEnded. */
@@ -86,6 +103,7 @@ export async function persistConversationState(
   const blobCompaction = compactConversationBlobs(input.conversationId, checkpoint)
   const blobs = blobCompaction.blobs
   const requestContext = getFrozenRequestContext(input.conversationId) ?? input.requestContext
+  const provenance = getTurnProvenance(input.sessionKey)
   await persistConversation(cacheDir, {
     sessionKey: input.sessionKey,
     conversationId: input.conversationId,
@@ -96,6 +114,9 @@ export async function persistConversationState(
     postCompactionRebase: input.postCompactionRebase,
     hostAgent: input.hostAgent,
     systemPromptHash: input.systemPromptHash,
+    ...(provenance?.conversationId === input.conversationId
+      ? { turnProvenance: serializeTurnProvenance(provenance) }
+      : {}),
   })
   trace(
     `conversation persistence: saved sessionKey=${input.sessionKey} ` +

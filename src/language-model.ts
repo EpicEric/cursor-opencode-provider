@@ -1,6 +1,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { createHash } from "node:crypto"
+import { APICallError } from "@ai-sdk/provider"
 import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3StreamResult, LanguageModelV3GenerateResult, LanguageModelV3StreamPart, LanguageModelV3Usage, LanguageModelV3FinishReason } from "@ai-sdk/provider"
 import type { CreateCursorOptions, CursorRetryOptions } from "./index.js"
 import {
@@ -131,11 +132,20 @@ import {
 } from "./protocol/blob-store.js"
 import {
   bindConversationId,
+  peekConversationId,
   resolveConversationGroupId,
 } from "./protocol/conversation-bind.js"
 import {
+  beginEmittedStep,
+  detectForeignHistory,
+  recordEmittedPart,
+  trackTurnProvenance,
+  type ForeignHistoryReason,
+} from "./protocol/turn-provenance.js"
+import {
   clearPersistedConversationState,
   hydrateConversationState,
+  hydrateTurnProvenance,
   persistConversationState,
 } from "./protocol/conversation-state.js"
 import { initializeConversationPersistence } from "./protocol/conversation-persistence.js"
@@ -188,7 +198,7 @@ import { isCompactionSession } from "./compaction-marker.js"
 import { resolveSessionWorkspaceRoot } from "./session-directory.js"
 import type { SeedHistoryMessage } from "./protocol/request.js"
 import { assertCursorUserImageSupport, extractCursorPromptImages } from "./image-input.js"
-import { resolveCursorModelSupportsImages } from "./model-metadata.js"
+import { getDocumentedCursorModelContext, resolveCursorModelSupportsImages } from "./model-metadata.js"
 import {
   consumeCursorShellResult,
   registerCursorShellCall,
@@ -284,6 +294,31 @@ function responseRequiredChannel(payload: Uint8Array): ResponseRequiredChannel |
   // Request tags are single-byte because all must-reply top-level fields are <16.
   const tag = payload[0]
   return tag !== undefined ? RESPONSE_REQUIRED_CHANNEL_BY_FIELD.get(tag >> 3) : undefined
+}
+
+// AgentServerMessage fields that never carry output or stateful activity.
+const ASM_INTERACTION_UPDATE_FIELD = 1
+const ASM_CHECKPOINT_UPDATE_FIELD = 3
+const ASM_KV_SERVER_MESSAGE_FIELD = 4
+const INTERACTION_UPDATE_HEARTBEAT_FIELD = 13
+
+/**
+ * True when the raw frame holds exactly one control message: a KV request, a
+ * checkpoint update, or an interaction update that is only a heartbeat. Extra
+ * fields inside a KV request are tolerated (Cursor has sent them live); extra
+ * top-level fields are not.
+ */
+export function isSoleControlFrame(payload: Uint8Array): boolean {
+  const fields = readAllFieldsStrict(payload)
+  if (!fields || fields.length !== 1) return false
+  const [field] = fields
+  if (field!.wt !== 2) return false
+  if (field!.fn === ASM_KV_SERVER_MESSAGE_FIELD || field!.fn === ASM_CHECKPOINT_UPDATE_FIELD) return true
+  if (field!.fn !== ASM_INTERACTION_UPDATE_FIELD || !field!.bytes) return false
+  const update = readAllFieldsStrict(field!.bytes)
+  return update?.length === 1
+    && update[0]!.fn === INTERACTION_UPDATE_HEARTBEAT_FIELD
+    && update[0]!.wt === 2
 }
 
 export type CursorRetryPolicy = {
@@ -815,6 +850,9 @@ async function doStreamImpl(
             trace(`pull: stream-start enqueue failed (cancelled) err=${(e as Error).message}`)
             return
           }
+          if (activeSession.openCodeSessionId) {
+            beginEmittedStep(activeSession.openCodeSessionId, activeSession.conversationId)
+          }
           activeSession = await pumpWithRecovery({
             initialSession: activeSession,
             controller,
@@ -930,13 +968,15 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      const recovery: CursorRunRecovery = checkpoint
-        ? {
-            kind: "resume",
-            conversationId: pumpedSession.conversationId,
-            checkpoint: Uint8Array.from(checkpoint),
-          }
-        : { kind: "rebase" }
+      const recovery: CursorRunRecovery = failure.checkpointUnusable
+        ? { kind: "rebase", reason: "checkpoint-unusable" }
+        : checkpoint
+          ? {
+              kind: "resume",
+              conversationId: pumpedSession.conversationId,
+              checkpoint: Uint8Array.from(checkpoint),
+            }
+          : { kind: "rebase" }
       session = await input.recover(recovery)
       if (recovery.kind === "resume") {
         session.usageEstimate = { ...pumpedSession.usageEstimate }
@@ -952,7 +992,7 @@ export async function pumpWithRecovery(input: {
 }
 
 export type CursorRunRecovery =
-  | { kind: "rebase" }
+  | { kind: "rebase"; reason?: "checkpoint-unusable" }
   | { kind: "resume"; conversationId: string; checkpoint: Uint8Array }
 
 const heartbeatWritePendingBySession = new WeakMap<CursorSession, boolean>()
@@ -1042,6 +1082,10 @@ async function startSession(
         ...(restored.systemPromptHash ? { systemPromptHash: restored.systemPromptHash } : {}),
       })
     }
+    // Provenance has its own LRU; refill it if only that entry was evicted.
+    await hydrateTurnProvenance(cacheDir, sessionKey).catch((error) => {
+      trace(`turn provenance: restore failed sessionKey=${sessionKey}: ${String(error)}`)
+    })
   }
   const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
   const hostAgent = typeof providerOptions?.[CURSOR_HOST_AGENT_OPTION] === "string"
@@ -1109,15 +1153,30 @@ async function startSession(
     isCompaction,
     historyRewrite: providerOptions?.[CURSOR_HISTORY_REWRITE_OPTION] === true,
   })
+  // Cursor could not restore the stored checkpoint (missing blobs) before this
+  // turn produced anything: reseed from the full host history as a new turn.
+  const checkpointUnusable = recovery?.kind === "rebase" && recovery.reason === "checkpoint-unusable"
+  // Another model (other provider or a local model) answered since this
+  // conversation's last checkpoint: resuming it would hide that work from Cursor.
+  // A Cursor-to-Cursor model switch resumes the same conversation, as in the CLI.
+  const foreignHistory: ForeignHistoryReason | undefined =
+    sessionKey && !resuming && !ephemeralRun && !resetState.reset && recovery?.kind !== "rebase"
+      ? detectForeignHistory({
+          sessionKey,
+          conversationId: peekConversationId(sessionKey),
+          prompt,
+        })
+      : undefined
   // Compaction must not reuse the prior conversation; its first normal turn
   // must also rebase so the summary-agent checkpoint cannot replace the normal
   // system prompt and OpenCode's newly compacted history.
   let bound = resuming
     ? { conversationId: resumeRecovery!.conversationId, reset: false, previousId: undefined }
     : bindConversationId(sessionKey, {
-        reset: resetState.reset || recovery?.kind === "rebase",
+        reset: resetState.reset || recovery?.kind === "rebase" || !!foreignHistory,
         ephemeral: ephemeralRun,
       })
+  if (sessionKey && !ephemeralRun) trackTurnProvenance(sessionKey, bound.conversationId)
   let conversationState = ephemeralRun
     ? undefined
     : resuming
@@ -1126,7 +1185,9 @@ async function startSession(
   let checkpointGraph: ConversationBlobGraphStats = conversationState
     ? inspectConversationBlobGraph(bound.conversationId, conversationState)
     : { count: 0, bytes: 0, complete: true }
-  const forcedResetReason: string | undefined = undefined
+  const forcedResetReason: string | undefined = foreignHistory
+    ? `foreign-history:${foreignHistory}`
+    : checkpointUnusable ? "checkpoint-unusable" : undefined
   // CLI soft-reuses incomplete / oversized graphs (100 MiB is export-only).
   // Never remint — warn and keep the sticky conversation + checkpoint.
   if (conversationState) {
@@ -1157,7 +1218,7 @@ async function startSession(
   }
 
   const lastUser = [...prompt].reverse().find((message) => message.role === "user")
-  let userText = recovery?.kind === "rebase"
+  let userText = recovery?.kind === "rebase" && !checkpointUnusable
     ? "Continue the interrupted turn from the conversation history above. Do not repeat completed work."
     : (extractUserText(lastUser) || ".")
   // After an approved SwitchMode, inject the Cursor CLI-shaped mode reminder
@@ -1217,8 +1278,10 @@ async function startSession(
     }
   }
   const history = extractPromptHistory(prompt, {
-    preserveTrailingUser: recovery?.kind === "rebase",
-    toolResults: isCompaction ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
+    preserveTrailingUser: recovery?.kind === "rebase" && !checkpointUnusable,
+    // A foreign-history rebase replays every tool result: the other model's work
+    // exists only in OpenCode history, never in a Cursor checkpoint.
+    toolResults: isCompaction || foreignHistory || checkpointUnusable ? "all" : (recovery?.kind === "rebase" ? "trailing" : "omit"),
   })
 
   await loadAvailableModels()
@@ -1260,9 +1323,10 @@ async function startSession(
         {
           supportsImages,
           // Content hashes are retained for the OpenCode session so growing
-          // history does not re-upload old screenshots. A recovery rebase opens
-          // a new Cursor conversation, so it must resend the same payload.
-          seenHistoryHashes: recovery?.kind === "rebase"
+          // history does not re-upload old screenshots. A recovery or
+          // foreign-history rebase opens a new Cursor conversation, so it must
+          // resend the same payload.
+          seenHistoryHashes: recovery?.kind === "rebase" || foreignHistory
             ? undefined
             : sentHistoryImageHashes(sessionKey),
           signal: callOptions.abortSignal,
@@ -1289,6 +1353,17 @@ async function startSession(
     picked,
     maxMode: hintMaxMode,
   })
+
+  if (foreignHistory || checkpointUnusable) {
+    assertForeignHistoryRebaseFits({
+      modelInfo,
+      cursorModelId,
+      maxMode,
+      history,
+      systemPrompt,
+      userText,
+    })
+  }
 
   // Do NOT pass callOptions.abortSignal into the h2 Run stream. OpenCode aborts
   // that signal when a turn ends with tool-calls; the Cursor stream must stay
@@ -1460,6 +1535,7 @@ async function startSession(
       switchModeInTurn: false,
     },
     openCodeSessionId: ephemeralRun ? undefined : sessionKey,
+    checkpointRebaseEligible: !ephemeralRun && !resuming && !recovery && !!conversationState,
     hostAgent,
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
@@ -2525,6 +2601,25 @@ export async function pump(
     switchModeInTurn: false,
   }
   cacheDiagnostics.pumpPasses++
+  // Only the first pass of a fresh Run resumed from a stored checkpoint, before
+  // anything but control frames (KV, heartbeat, checkpoint) arrived, may be
+  // reseeded after Cursor asked for blobs this client does not hold.
+  const checkpointRebaseCandidate = session.checkpointRebaseEligible === true
+    && cacheDiagnostics.pumpPasses === 1
+  let blobMiss = false
+  let onlyControlFrames = true
+  const finalizeFailure = (failure: CursorProviderError): CursorProviderError => {
+    if (checkpointRebaseCandidate && blobMiss && onlyControlFrames && failure.transient) {
+      trace(
+        `checkpoint unusable: Run failed after missing KV blobs before any output ` +
+          `sessionId=${session.sessionId} conversationId=${session.conversationId} err=${failure.message}`,
+      )
+      failure.replaySafe = true
+      failure.checkpointUnusable = true
+      return failure
+    }
+    return replaySafety.applyTo(failure)
+  }
   const { textId, reasoningId } = ids
   const advertisedToolNames = advertisedToolNamesFromDescriptors(session.toolDescriptors)
   const advertisedToolNameSet = new Set(
@@ -2574,6 +2669,13 @@ export async function pump(
     if (streamClosed) return false
     try {
       controller.enqueue(part)
+      if (session.openCodeSessionId) {
+        recordEmittedPart(
+          session.openCodeSessionId,
+          session.conversationId,
+          part as { type: string; delta?: unknown; toolCallId?: unknown },
+        )
+      }
       return true
     } catch (e) {
       streamClosed = true
@@ -2969,13 +3071,13 @@ export async function pump(
             `Cursor Run frame stream interrupted: ${(error as Error).message}`,
             { cause: error },
           )
-      throw replaySafety.applyTo(failure)
+      throw finalizeFailure(failure)
     }
     if (next.done) {
       closeOpenSpans()
       trace("pump: frames iterator ended before turn_ended")
       const failure = new CursorRunInterruptedError()
-      throw replaySafety.applyTo(failure)
+      throw finalizeFailure(failure)
     }
     const frame = next.value as Frame
 
@@ -2995,7 +3097,7 @@ export async function pump(
       const failure = payload
         ? connectFrameError(payload)
         : new CursorRunInterruptedError()
-      throw replaySafety.applyTo(failure)
+      throw finalizeFailure(failure)
     }
 
     // decodeFramePayload can throw on a corrupt gzip payload (gunzipSync).
@@ -3005,6 +3107,7 @@ export async function pump(
       payload = decodeFramePayload(frame)
     } catch (e) {
       replaySafety.markBarrier("unknown-or-malformed-frame")
+      onlyControlFrames = false
       trace(`gunzip FAILED (skipping frame): flags=0x${frame.flags.toString(16)} len=${frame.payload.length} err=${(e as Error).message}`)
       continue
     }
@@ -3016,6 +3119,7 @@ export async function pump(
       // (protobufjs throws "index out of range: …" on length overruns). Log it
       // and keep pumping.
       replaySafety.markBarrier("unknown-or-malformed-frame")
+      onlyControlFrames = false
       const channel = responseRequiredChannel(payload)
       if (channel) {
         failRunProtocol(`Cursor ${channel} request could not be decoded`, RUN_REQUEST_DECODE_FAILED)
@@ -3052,6 +3156,10 @@ export async function pump(
       sessionManager.recordSemanticProgress(session)
     }
     if (replayFrame.barrier) replaySafety.markBarrier(replayFrame.barrier)
+    // Reseeding is allowed only while every frame so far was positively a
+    // control frame. Anything else, including unknown top-level fields, may have
+    // carried output or stateful activity.
+    if (!isSoleControlFrame(payload)) onlyControlFrames = false
 
     {
       const iuKind = iu ? Object.keys(iu).find((k) => iu[k]) : undefined
@@ -3873,6 +3981,9 @@ export async function pump(
           `setDataLen=${(kv.set_blob_args as any)?.blob_data?.length ?? "-"}`,
       )
       const handled = handleKvServerMessage(kv, session)
+      // Content-as-id reads are answered by echoing the id back (`echoed`); only a
+      // hash we cannot serve means the checkpoint references state we lost.
+      if (handled?.kind === "get" && !handled.found && !handled.echoed) blobMiss = true
       if (handled) {
         try {
           await writeWithBackpressure(
@@ -3962,24 +4073,73 @@ function extractToolResults(prompt: LanguageModelV3CallOptions["prompt"]): Extra
  * messages after the last non-tool message. Mid-prompt historical tool results
  * are ignored — they are conversation history, not replies for a held-open Run.
  */
+// OpenCode 2.x appends these host notes after the tool results of a step:
+// mid-turn system updates (skill / MCP availability changes) are lowered to a
+// user message wrapping `<system-update>`, and tool-result media is re-sent as
+// a user message starting with this caption.
+const SYSTEM_UPDATE_OPEN = "<system-update>"
+const SYSTEM_UPDATE_CLOSE = "</system-update>"
+const TOOL_MEDIA_CAPTION = "Attached media from tool result:"
+
+type HostTailNote = { text?: string }
+
+function hostTailNote(message: LanguageModelV3CallOptions["prompt"][number]): HostTailNote | undefined {
+  if (message.role === "system") return { text: message.content }
+  if (message.role !== "user" || !Array.isArray(message.content) || message.content.length === 0) return undefined
+  const [first] = message.content
+  if (first?.type === "text" && first.text === TOOL_MEDIA_CAPTION) return {}
+  const texts: string[] = []
+  for (const part of message.content) {
+    if (part.type !== "text") return undefined
+    const text = part.text.trim()
+    if (!text.startsWith(SYSTEM_UPDATE_OPEN) || !text.endsWith(SYSTEM_UPDATE_CLOSE)) return undefined
+    texts.push(text)
+  }
+  return { text: texts.join("\n") }
+}
+
+/**
+ * Split off host notes that trail the live tool results. They are not a new
+ * user turn: the held Run must still receive its tool results.
+ */
+function liveTail(prompt: LanguageModelV3CallOptions["prompt"]): { end: number; notes: string[] } {
+  let end = prompt.length
+  const notes: string[] = []
+  while (end > 0) {
+    const note = hostTailNote(prompt[end - 1])
+    if (!note) break
+    if (note.text) notes.unshift(note.text)
+    end--
+  }
+  return { end, notes }
+}
+
 export function extractTrailingToolResults(
   prompt: LanguageModelV3CallOptions["prompt"],
 ): ExtractedToolResult[] {
-  if (prompt.length === 0) return []
-  let i = prompt.length - 1
+  const { end, notes } = liveTail(prompt)
+  let i = end - 1
   while (i >= 0 && prompt[i].role === "tool") i--
-  // Continuations end with tool messages. Anything else (user/assistant/system)
+  // Continuations end with tool messages. Anything else (user/assistant)
   // means this is a fresh model call that merely carries tools in history.
-  if (i === prompt.length - 1) return []
-  return extractToolResults(prompt.slice(i + 1))
+  if (i === end - 1) return []
+  const results = extractToolResults(prompt.slice(i + 1, end))
+  // A Run continuation only carries exec results, so the host notes ride on the
+  // last one; otherwise Cursor would never see e.g. a removed skill.
+  const last = results.at(-1)
+  if (last && notes.length > 0) {
+    results[results.length - 1] = { ...last, output: [last.output, ...notes].filter(Boolean).join("\n\n") }
+  }
+  return results
 }
 
 /** Detect a host-owned canonical plan review, excluding Cursor exec replies. */
 export function hasApprovedUncorrelatedPlanStageResult(
   prompt: LanguageModelV3CallOptions["prompt"],
 ): boolean {
-  if (prompt.length === 0 || prompt[prompt.length - 1].role !== "tool") return false
-  for (let i = prompt.length - 1; i >= 0 && prompt[i].role === "tool"; i--) {
+  const { end } = liveTail(prompt)
+  if (end === 0 || prompt[end - 1].role !== "tool") return false
+  for (let i = end - 1; i >= 0 && prompt[i].role === "tool"; i--) {
     const message = prompt[i]
     if (!Array.isArray(message.content)) continue
     for (const part of message.content) {
@@ -4347,10 +4507,55 @@ function appendSeedHistory(
   out.push({ role, content })
 }
 
+/** Share of the target context a foreign-history rebase may fill before compaction. */
+export const FOREIGN_HISTORY_REBASE_CONTEXT_SHARE = 0.8
+
+/**
+ * A foreign-history rebase replays the full host history. When that cannot fit,
+ * fail before opening a Run with an error hosts classify as context overflow
+ * (HTTP 413 + "prompt is too long"), so the host compacts and retries.
+ */
+export function assertForeignHistoryRebaseFits(input: {
+  modelInfo: ModelInfo | undefined
+  cursorModelId: string
+  maxMode: boolean
+  history: SeedHistoryMessage[]
+  systemPrompt: string | undefined
+  userText: string
+}): void {
+  const documented = getDocumentedCursorModelContext(input.cursorModelId)
+  const limit = input.maxMode
+    ? (input.modelInfo?.maxContextForMaxMode ?? documented?.maxContextForMaxMode ?? 1_000_000)
+    : (input.modelInfo?.maxContext ?? documented?.maxContext ?? 200_000)
+  const chars = input.history.reduce((sum, message) => sum + message.content.length, 0)
+    + (input.systemPrompt?.length ?? 0)
+    + input.userText.length
+  const tokens = estimateTokens(chars)
+  const budget = Math.floor(limit * FOREIGN_HISTORY_REBASE_CONTEXT_SHARE)
+  if (tokens <= budget) return
+  trace(
+    `foreign-history rebase too large: model=${input.cursorModelId} estimatedTokens=${tokens} ` +
+      `budget=${budget} limit=${limit} → requesting host compaction`,
+  )
+  throw new APICallError({
+    message: `prompt is too long: rebasing this session onto Cursor needs ~${tokens} tokens, ` +
+      `over ${budget} of the ${limit}-token context`,
+    url: "cursor://agent.v1.AgentService/Run",
+    requestBodyValues: {},
+    statusCode: 413,
+    isRetryable: false,
+  })
+}
+
 /** OpenCode session id header, if present. */
 export function opencodeSessionKey(callOptions: LanguageModelV3CallOptions): string | undefined {
   const h = callOptions.headers ?? {}
+  // OpenCode 2.x sends x-session-id / x-session-affinity / x-opencode-session
+  // as the parent (or fork source) session so subagents share prompt-cache
+  // affinity. Only x-opencode-session-id names the requesting session; keying
+  // on the others makes a subagent take over its parent's Cursor conversation.
   const raw =
+    h["x-opencode-session-id"] ??
     h["x-session-id"] ??
     h["X-Session-Id"] ??
     h["x-session-affinity"] ??
