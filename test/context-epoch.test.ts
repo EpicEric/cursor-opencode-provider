@@ -155,6 +155,37 @@ describe("context epoch (V2-style)", () => {
     expect(held.midConversationMessage).toBeUndefined()
   })
 
+  it("delivers current instructions once when recovering a changed persisted rule", () => {
+    const input = {
+      conversationId: "conv-rule-restart",
+      hasCheckpoint: true,
+      hostSystem: "Plan only. Do not edit files.",
+      guidance: "Use the question tool.",
+      hostAgent: "plan",
+      workspaceRoot: "/workspace",
+      recoveredBaseline: "Build and edit files.\n\nUse the question tool.",
+    }
+    const recovered = admitContextEpoch(input)
+    expect(recovered.midConversationMessage).toContain("Plan only. Do not edit files.")
+    expect(recovered.midConversationMessage).toContain("Use the question tool.")
+    expect(recovered.epoch.baselineSystemPrompt).toBe(input.recoveredBaseline)
+    expect(recovered.seedSystemPrompt).toBeUndefined()
+    expect(admitContextEpoch(input).midConversationMessage).toBeUndefined()
+  })
+
+  it("reasserts a recovered baseline in case the checkpoint contains an intervening update", () => {
+    const recovered = admitContextEpoch({
+      conversationId: "conv-rule-unchanged",
+      hasCheckpoint: true,
+      hostSystem: "baseline",
+      guidance: "guidance",
+      workspaceRoot: "/workspace",
+      recoveredBaseline: "baseline\n\nguidance",
+    })
+    expect(recovered.midConversationMessage).toContain("baseline\n\nguidance")
+    expect(recovered.epoch.baselineSystemPrompt).toBe("baseline\n\nguidance")
+  })
+
   it("ends the epoch on conversation remint (compaction transfer)", () => {
     admitContextEpoch({
       conversationId: "old",

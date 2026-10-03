@@ -155,7 +155,7 @@ export function hostPlansDir(_workspaceRoot?: string): string {
 }
 
 /**
- * Cursor-compatible path slug (`/Users/a/b` → `Users-a-b`).
+ * Cursor-compatible path slug (`/workspace/a/b` → `workspace-a-b`).
  * Used for per-workspace metadata under the host cache.
  */
 export function slugifyWorkspacePath(workspaceRoot: string): string {

@@ -25,7 +25,12 @@ async function readJsonConfig(dir: string): Promise<OpencodeJson> {
     if (!(await exists(file))) continue
     try {
       const raw = await readFile(file, "utf-8")
-      const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
+      // Match strings first so comment markers inside URLs/plugin specifiers
+      // survive. Remove comments before trailing commas (which may precede one).
+      const uncommented = raw.replace(/"(?:\\.|[^"\\])*"|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*/g,
+        token => token.startsWith('"') ? token : " ")
+      const stripped = uncommented.replace(/"(?:\\.|[^"\\])*"|,\s*(?=[}\]])/g,
+        token => token.startsWith('"') ? token : "")
       return JSON.parse(stripped) as OpencodeJson
     } catch {
       return {}

@@ -26,10 +26,10 @@ export type ContextSourceSnapshot = {
 
 export type ContextEpoch = {
   conversationId: string
-  /** Exact system text seeded at epoch start. Empty when recovered from checkpoint. */
+  /** Exact system text at epoch start. Empty if a legacy checkpoint has no persisted rule. */
   baselineSystemPrompt: string
   baselineHash: string
-  /** True when restart hydrated past a checkpoint without the original baseline bytes. */
+  /** True when restart hydrated past a checkpoint without the last source snapshot. */
   recovered: boolean
   snapshot: ContextSourceSnapshot
 }
@@ -47,6 +47,8 @@ export type AdmitContextEpochInput = {
    * never folded into the frozen baseline.
    */
   oneShotReminders?: readonly string[]
+  /** Original system rule restored with RequestContext after a restart. */
+  recoveredBaseline?: string
 }
 
 export type AdmitContextEpochResult = {
@@ -145,8 +147,8 @@ function combineMessages(parts: readonly string[]): string | undefined {
  * - First seed: freeze baseline, return it as seedSystemPrompt; one-shots → mid.
  * - Checkpoint turn: never returns seedSystemPrompt; source diffs + one-shots → mid.
  * - Reseed same epoch: return frozen baseline bytes (not live host text).
- * - Recovered (restart past a checkpoint, original bytes unknown): never freeze
- *   live host text as a new baseline and never send a seed systemPrompt.
+ * - Recovered: restore the persisted rule and reassert live context once on the
+ *   user turn. A legacy checkpoint without a rule has no original bytes.
  */
 export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEpochResult {
   const conversationId = input.conversationId
@@ -156,17 +158,27 @@ export function admitContextEpoch(input: AdmitContextEpochInput): AdmitContextEp
 
   if (!existing) {
     if (input.hasCheckpoint) {
-      // Restart / soft-evict recovery: Cursor already holds the baseline in the
-      // checkpoint. Record the live snapshot without reseeding systemPrompt.
+      // Restart / soft-evict recovery: keep the original rule and reassert the
+      // live instructions chronologically without changing the cache prefix.
+      const baselineSystemPrompt = input.recoveredBaseline ?? ""
       const epoch: ContextEpoch = {
         conversationId,
-        baselineSystemPrompt: "",
-        baselineHash: "",
+        baselineSystemPrompt,
+        baselineHash: baselineSystemPrompt ? sha(baselineSystemPrompt) : "",
         recovered: true,
         snapshot: nextSnap,
       }
       touch(epoch)
-      const midConversationMessage = combineMessages(oneShots)
+      // The persisted rule is the original prefix, not necessarily the current
+      // host instructions. Reconcile live context once before recording its
+      // snapshot; otherwise a changed prompt is silently treated as admitted.
+      // Even equality with the original baseline needs an update: the last
+      // checkpoint may contain an intervening mode/instruction change.
+      const liveBaseline = buildBaseline(input)
+      const recoveryUpdate = baselineSystemPrompt && liveBaseline
+        ? wrapReminder("Current host system instructions after session recovery:\n\n" + liveBaseline)
+        : ""
+      const midConversationMessage = combineMessages([recoveryUpdate, ...oneShots])
       trace(
         `context epoch: recovered conversationId=${conversationId} ` +
           `oneShots=${oneShots.length}`,

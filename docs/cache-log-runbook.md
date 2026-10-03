@@ -130,6 +130,12 @@ session binding, checkpoint, reachable blobs, and frozen context were hydrated.
 `missing`, `invalid`, `expired`, or restore failure means the next Run may be
 cold even though OpenCode still has its own chat history.
 
+The first resumed normal Run preserves the persisted system-instructions rule
+and reasserts current host instructions on the user-turn tail. The last source
+snapshot is not persisted: even if live instructions match the original rule,
+the checkpoint may contain a later instruction change. Subsequent Runs admit
+only new source changes (`src/context/epoch.ts:160`, `test/context-epoch.test.ts:158`).
+
 ### 2. Check prefix stability
 
 | Field | Interpretation |

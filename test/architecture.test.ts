@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs"
 import path from "node:path"
+import ts from "typescript"
 
 const ROOT = path.resolve(import.meta.dir, "..")
 
@@ -39,6 +40,25 @@ function violations(files: readonly string[], pattern: RegExp): string[] {
   return found
 }
 
+function staticImports(text: string, modulePattern: RegExp, runtimeOnly = false): string[] {
+  const parsed = ts.createSourceFile("surface.ts", text, ts.ScriptTarget.Latest, true)
+  return parsed.statements.flatMap(statement => {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) return []
+    if (runtimeOnly && statement.importClause?.isTypeOnly) return []
+    modulePattern.lastIndex = 0
+    return modulePattern.test(statement.moduleSpecifier.text) ? [statement.moduleSpecifier.text] : []
+  })
+}
+
+function importViolations(files: readonly string[], pattern: RegExp, runtimeOnly = false): string[] {
+  return files.flatMap(file => staticImports(source(file), pattern, runtimeOnly)
+    .map(specifier => `${relative(file)}: ${specifier}`))
+}
+
+// Cursor's own agent.v1 Pi* exec types are native wire vocabulary. Detect the
+// external host family through its package/config identities, not that prefix.
+const FOREIGN_VOCABULARY = /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|@deepseek-ai\/|@earendil-works\/|@oh-my-pi\/|mimocode|kilocode|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevin\b|\bDevinPlugin\b|\bcreateDevin\b/
+
 const SOURCE_FILES = filesUnder("src", [".ts", ".d.ts"])
 const TEST_FILES = filesUnder("test", [".ts"])
   .filter(file => path.basename(file) !== "architecture.test.ts")
@@ -59,8 +79,8 @@ describe("provider / compatibility-layer architecture", () => {
 
   test("provider executable source and tests contain no fork identities or fork-only vocabulary", () => {
     const found = violations(
-      [...SOURCE_FILES, ...TEST_FILES],
-      /MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevinPlugin\b|\bcreateDevin\b/,
+      [...SOURCE_FILES, ...TEST_FILES, ...PACKAGE_FILES],
+      FOREIGN_VOCABULARY,
     )
     expect(found).toEqual([])
   })
@@ -86,14 +106,14 @@ describe("provider / compatibility-layer architecture", () => {
       "src/web-search-tool.ts",
       "src/image-save-tool.ts",
     ].map(file => path.join(ROOT, file))
-    const found = violations(targets, /^\s*import(?!\s+type\b)[^\n]*["']@opencode-ai\/plugin(?:\/[^"']*)?["']/)
+    const found = importViolations(targets, /^@opencode-ai\/plugin(?:\/|$)/, true)
     expect(found).toEqual([])
   })
 
   test("OpenCode 2.0 plugin does not depend on the host SDK package", () => {
-    const found = violations(
+    const found = importViolations(
       [...SOURCE_FILES, ...DIST_FILES],
-      /^\s*import[^\n]*["']@opencode\/plugin(?:\/[^"']*)?["']/,
+      /^@opencode\/plugin(?:\/|$)/,
     )
     expect(found).toEqual([])
     const pkg = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
@@ -117,11 +137,24 @@ describe("provider / compatibility-layer architecture", () => {
     if (DIST_FILES.length === 0) return
     expect(violations(
       DIST_FILES,
-      /@opencode-compat\/|MIMOCODE(?:_[A-Z_]+)?|KILO(?:_[A-Z_]+)?|PI_CODING_AGENT_DIR|PI_CONFIG_DIR|\bactor_id\b|\bhashline\b|xd:\/\/|\bMiMo\b|\bKilo\b|\boh-my-pi\b|\bOMP\b|\bDSH\b|DeepSeek Harness|deepseek-harness|exit_plan_mode|ask_user_question|devin-opencode-provider|\bDevinPlugin\b|\bcreateDevin\b/,
+      FOREIGN_VOCABULARY,
     )).toEqual([])
-    expect(violations(
+    expect(importViolations(
       DIST_FILES.filter(file => /(?:plugin(?:-v2|-opencode2)?|web-search-tool|image-save-tool)\.js$/.test(file)),
-      /^\s*import[^\n]*["']@opencode-ai\/plugin(?:\/[^"']*)?["']/,
+      /^@opencode-ai\/plugin(?:\/|$)/,
     )).toEqual([])
+  })
+
+  test("static import checks inspect complete declarations and distinguish type imports", () => {
+    const text = `import {\n  tool\n} from "@opencode-ai/plugin"\nimport type { Hooks } from "@opencode-ai/plugin"`
+    expect(staticImports(text, /^@opencode-ai\/plugin$/, true)).toEqual(["@opencode-ai/plugin"])
+    expect(staticImports(text, /^@opencode-ai\/plugin$/)).toHaveLength(2)
+    expect(staticImports('const value = "import { tool } from \\\"@opencode-ai/plugin\\\""', /^@opencode-ai\/plugin$/)).toEqual([])
+  })
+
+  test("foreign identity checks cover every host family and other providers", () => {
+    for (const name of ["mimocode", "kilocode", "PI_CODING_AGENT_DIR", "OMP", "@earendil-works/pi-ai", "@oh-my-pi/pi-ai", "@deepseek-ai/dsh-llm", "DSH", "Devin", "createDevin"]) {
+      expect(FOREIGN_VOCABULARY.test(name)).toBe(true)
+    }
   })
 })

@@ -232,4 +232,20 @@ describe("loadMergedConfig OPENCODE_DISABLE_PROJECT_CONFIG", () => {
     const config = await loadMergedConfig(root)
     expect(config.mcp?.github).toBeUndefined()
   })
+
+  it("reads JSONC trailing commas without stripping comment markers from strings", async () => {
+    process.env.OPENCODE_DISABLE_PROJECT_CONFIG = "0"
+    const workspace = path.join(root, "jsonc")
+    await mkdir(workspace, { recursive: true })
+    await writeFile(path.join(workspace, "opencode.jsonc"), `{
+      // Config comments are allowed alongside strings containing comment tokens.
+      "mcp": {
+        "docs": { "type": "remote", "url": "https://example.test/docs/*literal*/", },
+      }, /* trailing comma before a comment */
+      "plugin": ["fixture/*literal*/",],
+    }`)
+    const config = await loadMergedConfig(workspace)
+    expect(config.mcp?.docs).toEqual({ type: "remote", url: "https://example.test/docs/*literal*/" })
+    expect(config.plugin).toContain("fixture/*literal*/")
+  })
 })

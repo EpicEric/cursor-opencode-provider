@@ -173,8 +173,8 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
-import { getOrBuildRequestContext } from "./context/frozen.js"
-import type { SystemInstructions } from "./context/build.js"
+import { getFrozenRequestContext, getOrBuildRequestContext } from "./context/frozen.js"
+import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
 import { loadMergedConfig } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
@@ -1334,12 +1334,13 @@ async function startSession(
       hostAgent,
       workspaceRoot,
       oneShotReminders,
+      recoveredBaseline: systemInstructionsRuleText(getFrozenRequestContext(conversationId) ?? {}),
     })
     systemPrompt = startedWithCheckpoint ? undefined : admitted.seedSystemPrompt
     userText = appendMidConversationMessage(userText, admitted.midConversationMessage)
     // The epoch baseline is the rule for every Run of this conversation. A
-    // recovered epoch (restart past a checkpoint) has no baseline bytes: keep
-    // the persisted rule, and use the live context only if none was persisted.
+    // recovered epoch keeps the persisted rule, and uses live context only if
+    // a legacy checkpoint was persisted without baseline bytes.
     const frozenBaseline = admitted.epoch.baselineSystemPrompt
     const instructionText = frozenBaseline
       || [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
@@ -1603,7 +1604,7 @@ async function startSession(
     hostAgent,
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
-    toolCatalog: snapshotToolCatalog(sessionKey),
+    toolCatalog: sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(tools),
     knownMcpServers,
     stream,
     frames: stream.frames()[Symbol.asyncIterator](),
@@ -4659,7 +4660,14 @@ export async function refreshHeldSessionToolCatalog(
     isCompaction,
     abortSignal: callOptions.abortSignal,
   })
-  const webToolAliases = buildCustomWebToolAliases(toolState.advertisedTools)
+  // A standalone caller has no host session key for the process catalog cache.
+  // Its held Run still owns an epoch: keep its prefix and append new names.
+  const cachedTools = !sessionKey ? session.toolCatalog ?? [] : []
+  const cachedNames = new Set(cachedTools.map(tool => tool.name))
+  const advertisedTools = cachedTools.length > 0
+    ? [...cachedTools, ...toolState.advertisedTools.filter(tool => !cachedNames.has(tool.name))]
+    : toolState.advertisedTools
+  const webToolAliases = buildCustomWebToolAliases(advertisedTools)
   const cursorTools = webToolAliases.advertisedTools
   const knownMcpServers = session.knownMcpServers ?? []
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
@@ -4675,10 +4683,10 @@ export async function refreshHeldSessionToolCatalog(
           : undefined)
         .filter((agent): agent is { name: string; description: string | undefined } => !!agent)
     : []
-  session.toolCatalog = snapshotToolCatalog(sessionKey)
+  session.toolCatalog = sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(advertisedTools)
   session.toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
   session.toolAliases = webToolAliases.aliases
-  session.hostToolDialect = hostToolDialectFromTools(toolState.advertisedTools, session.hostToolDialect)
+  session.hostToolDialect = hostToolDialectFromTools(advertisedTools, session.hostToolDialect)
   session.subagentCatalog = {
     ...discoveredSubagentCatalog,
     agents: [...new Map(

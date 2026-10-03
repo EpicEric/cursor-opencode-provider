@@ -506,6 +506,22 @@ describe("deliverContinuationResults", () => {
 })
 
 describe("refreshHeldSessionToolCatalog", () => {
+  it("keeps the held catalog across session-less continuation shrinks and grows", async () => {
+    const live = fakeSession("standalone-grow")
+    const schema = { type: "object", properties: {} }
+    const call = (names: string[]) => ({
+      prompt: [],
+      tools: names.map(name => ({ type: "function", name, description: name, inputSchema: schema })),
+    }) as LanguageModelV3CallOptions
+    await refreshHeldSessionToolCatalog(live, call(["read", "write"]))
+    const original = live.toolDescriptors
+    await refreshHeldSessionToolCatalog(live, call(["read"]))
+    expect(live.toolDescriptors).toEqual(original)
+    expect(live.permittedToolNames).toEqual(new Set(["read"]))
+    await refreshHeldSessionToolCatalog(live, call(["alpha", "read"]))
+    expect(live.toolCatalog?.map(tool => tool.name)).toEqual(["read", "write", "alpha"])
+  })
+
   it("makes tools added after Run open appear in the next exec #36 reply", async () => {
     const live = fakeSession("mcp-grow")
     live.openCodeSessionId = "ses_mcp_grow"
