@@ -2,19 +2,14 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { mkdir, writeFile, rm } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
-import { collectRules, fetchRemoteInstruction } from "../src/context/rules.js"
-import { collectSkills } from "../src/context/skills.js"
+import { isProjectConfigDisabled, loadMergedConfig } from "../src/context/rules.js"
 import { buildRequestContext } from "../src/context/build.js"
 import { workspaceRootFromRequestContext } from "../src/context/env.js"
 import { opencodeProjectDir } from "../src/context/paths.js"
 import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
 
-describe("collectRules / buildRequestContext", () => {
+describe("buildRequestContext", () => {
   let root: string
-  // Global discovery (agents, skills, rules) reads $XDG_CONFIG_HOME/opencode
-  // (else ~/.config/opencode) and ~/.claude; an empty HOME with no
-  // XDG_CONFIG_HOME keeps the expected catalogs exact on machines with their
-  // own global agents or rules.
   let isolatedHome: string
   let prevHome: string | undefined
   let prevXdgConfig: string | undefined
@@ -28,27 +23,13 @@ describe("collectRules / buildRequestContext", () => {
     process.env.HOME = isolatedHome
     root = path.join(os.tmpdir(), `cursor-ctx-${process.pid}-${Date.now()}`)
     await mkdir(root, { recursive: true })
-    await writeFile(path.join(root, "AGENTS.md"), "# Project rules\nUse bun.\n")
-    await mkdir(path.join(root, ".opencode", "skills", "demo"), { recursive: true })
-    await writeFile(
-      path.join(root, ".opencode", "skills", "demo", "SKILL.md"),
-      "---\nname: demo\ndescription: Demo skill\n---\n\nDo the demo.\n",
-    )
-    await mkdir(path.join(root, ".opencode", "agents"), { recursive: true })
-    await writeFile(
-      path.join(root, ".opencode", "agents", "reviewer.md"),
-      "---\nname: reviewer\ndescription: Review local changes\n---\n\nReview carefully.\n",
-    )
-    await mkdir(path.join(root, ".cursor", "rules"), { recursive: true })
-    await writeFile(path.join(root, ".cursor", "rules", "extra.md"), "cursor instruction via opencode.json")
     await writeFile(
       path.join(root, "opencode.json"),
       JSON.stringify({
-        instructions: [".cursor/rules/*.md"],
         permission: "allow",
         mcp: {
           github: { type: "remote", url: "https://example.test/github" },
-          "my server": { type: "remote", url: "https://example.test/custom" },
+          my_server: { type: "local", command: ["true"] },
         },
       }),
     )
@@ -61,17 +42,6 @@ describe("collectRules / buildRequestContext", () => {
     else process.env.XDG_CONFIG_HOME = prevXdgConfig
     await rm(root, { recursive: true, force: true })
     await rm(isolatedHome, { recursive: true, force: true })
-  })
-
-  it("loads AGENTS.md and honors .cursor paths listed in instructions", async () => {
-    const { rules } = await collectRules(root)
-    expect(rules.some((r) => r.fullPath.endsWith("AGENTS.md"))).toBe(true)
-    expect(rules.some((r) => r.fullPath.replace(/\\/g, "/").includes("/.cursor/rules/extra.md"))).toBe(true)
-  })
-
-  it("discovers .opencode skills", async () => {
-    const skills = await collectSkills(root, root)
-    expect(skills.some((s) => s.name === "demo")).toBe(true)
   })
 
   it("does not invent custom subagents when the host schema has no catalog", async () => {
@@ -156,8 +126,6 @@ describe("collectRules / buildRequestContext", () => {
     expect(ctx.env_info_complete).toBe(true)
     expect(ctx.web_search_enabled).toBe(false)
     expect(ctx.web_fetch_enabled).toBe(false)
-    // OpenCode owns execution permissions. A global allow boolean cannot be
-    // translated into Cursor's allow/block instruction-list messages.
     expect(ctx).not.toHaveProperty("user_permissions_auto_run")
     expect(ctx).not.toHaveProperty("project_permissions_auto_run")
     const bytes = encodeMessage("RequestContext", ctx)
@@ -179,7 +147,6 @@ describe("collectRules / buildRequestContext", () => {
       })
       const env = ctx.env as Record<string, unknown>
       expect(env.workspace_paths).toEqual([path.resolve(root)])
-      // Must track the workspace, not the host process cwd (daemon often starts in $HOME).
       expect(env.process_working_directory).toBe(path.resolve(root))
       expect(env.is_working_dir_home_dir).toBe(false)
       expect(env.project_folder).toBe(expectedProject)
@@ -219,96 +186,35 @@ describe("collectRules / buildRequestContext", () => {
   })
 })
 
-describe("collectRules remote instructions (F1 HTTPS-only)", () => {
+describe("loadMergedConfig OPENCODE_DISABLE_PROJECT_CONFIG", () => {
   let root: string
-  let realFetch: typeof globalThis.fetch
-  let fetchedUrls: string[]
-
-  beforeAll(async () => {
-    root = path.join(os.tmpdir(), `cursor-ctx-remote-${process.pid}-${Date.now()}`)
-    await mkdir(root, { recursive: true })
-    await writeFile(path.join(root, "AGENTS.md"), "# Project\n")
-  })
-
-  afterAll(async () => {
-    await rm(root, { recursive: true, force: true })
-  })
-
-  beforeEach(async () => {
-    realFetch = globalThis.fetch
-    fetchedUrls = []
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input)
-      fetchedUrls.push(url)
-      return new Response("# remote instruction\n", { status: 200 })
-    }) as typeof fetch
-  })
-
-  afterEach(() => {
-    globalThis.fetch = realFetch
-  })
-
-  it("fetches https:// instructions and includes content", async () => {
-    await writeFile(
-      path.join(root, "opencode.json"),
-      JSON.stringify({ instructions: ["https://example.com/rules.md"] }),
-    )
-    const { rules } = await collectRules(root)
-    expect(fetchedUrls).toEqual(["https://example.com/rules.md"])
-    expect(rules.some((r) => r.fullPath === "https://example.com/rules.md" && r.content.includes("remote instruction"))).toBe(
-      true,
-    )
-  })
-
-  it("skips http:// instructions without fetching", async () => {
-    await writeFile(
-      path.join(root, "opencode.json"),
-      JSON.stringify({ instructions: ["http://example.com/rules.md", "https://example.com/ok.md"] }),
-    )
-    const { rules } = await collectRules(root)
-    expect(fetchedUrls).toEqual(["https://example.com/ok.md"])
-    expect(rules.some((r) => r.fullPath.startsWith("http://"))).toBe(false)
-    expect(rules.some((r) => r.fullPath === "https://example.com/ok.md")).toBe(true)
-  })
-
-  it("keeps the timeout active while consuming the response body", async () => {
-    let aborted = false
-    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => ({
-      ok: true,
-      text: () => new Promise<string>((_resolve, reject) => {
-        const signal = init?.signal
-        const onAbort = () => {
-          aborted = true
-          reject(new DOMException("Aborted", "AbortError"))
-        }
-        if (signal?.aborted) onAbort()
-        else signal?.addEventListener("abort", onAbort, { once: true })
-      }),
-    })) as typeof fetch
-
-    expect(await fetchRemoteInstruction("https://example.com/stalled.md", 5)).toBeUndefined()
-    expect(aborted).toBe(true)
-  })
-})
-
-describe("collectRules OPENCODE_DISABLE_PROJECT_CONFIG (F2)", () => {
-  let root: string
+  let isolatedHome: string
   let prev: string | undefined
+  let prevHome: string | undefined
+  let prevXdgConfig: string | undefined
 
   beforeAll(async () => {
-    root = path.join(os.tmpdir(), `cursor-ctx-disable-project-${process.pid}-${Date.now()}`)
+    prevHome = process.env.HOME
+    prevXdgConfig = process.env.XDG_CONFIG_HOME
+    delete process.env.XDG_CONFIG_HOME
+    isolatedHome = path.join(os.tmpdir(), `cursor-cfg-home-${process.pid}-${Date.now()}`)
+    await mkdir(isolatedHome, { recursive: true })
+    process.env.HOME = isolatedHome
+    root = path.join(os.tmpdir(), `cursor-cfg-disable-project-${process.pid}-${Date.now()}`)
     await mkdir(root, { recursive: true })
-    await writeFile(path.join(root, "AGENTS.md"), "# Should be skipped when project config disabled\n")
-    await mkdir(path.join(root, ".cursor", "rules"), { recursive: true })
-    await writeFile(path.join(root, ".cursor", "rules", "extra.md"), "project instruction")
     await writeFile(
       path.join(root, "opencode.json"),
-      JSON.stringify({ instructions: [".cursor/rules/*.md", "~/.ssh/id_rsa"] }),
+      JSON.stringify({ mcp: { github: { type: "remote" } } }),
     )
   })
 
   afterAll(async () => {
+    if (prevHome === undefined) delete process.env.HOME
+    else process.env.HOME = prevHome
+    if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = prevXdgConfig
     await rm(root, { recursive: true, force: true })
+    await rm(isolatedHome, { recursive: true, force: true })
   })
 
   beforeEach(() => {
@@ -321,10 +227,9 @@ describe("collectRules OPENCODE_DISABLE_PROJECT_CONFIG (F2)", () => {
     else process.env.OPENCODE_DISABLE_PROJECT_CONFIG = prev
   })
 
-  it("skips project AGENTS.md and project instructions", async () => {
-    const { rules, config } = await collectRules(root)
-    expect(config.instructions ?? []).not.toContain(".cursor/rules/*.md")
-    expect(rules.some((r) => r.fullPath.replace(/\\/g, "/").includes("/.cursor/rules/extra.md"))).toBe(false)
-    expect(rules.some((r) => r.fullPath === path.resolve(root, "AGENTS.md"))).toBe(false)
+  it("skips project opencode.json when project config is disabled", async () => {
+    expect(isProjectConfigDisabled()).toBe(true)
+    const config = await loadMergedConfig(root)
+    expect(config.mcp?.github).toBeUndefined()
   })
 })

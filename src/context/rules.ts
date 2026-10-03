@@ -1,12 +1,6 @@
-import { readFile, readdir, stat } from "node:fs/promises"
-import { homedir } from "node:os"
+import { readFile, stat } from "node:fs/promises"
 import path from "node:path"
-import { opencodeConfigFileNames, opencodeGlobalConfigDirs, opencodeProjectConfigDirs, resolveHomeRelative } from "./paths.js"
-
-export type CollectedRule = {
-  fullPath: string
-  content: string
-}
+import { opencodeConfigFileNames, opencodeGlobalConfigDirs, opencodeProjectConfigDirs } from "./paths.js"
 
 export type OpencodeJson = {
   instructions?: string[]
@@ -40,120 +34,10 @@ async function readJsonConfig(dir: string): Promise<OpencodeJson> {
   return {}
 }
 
-export async function findGitWorktree(start: string): Promise<string> {
-  let dir = path.resolve(start)
-  for (;;) {
-    if (await exists(path.join(dir, ".git"))) return dir
-    const parent = path.dirname(dir)
-    if (parent === dir) return path.resolve(start)
-    dir = parent
-  }
-}
-
-async function findUp(name: string, start: string, stop: string): Promise<string | undefined> {
-  let dir = path.resolve(start)
-  const root = path.resolve(stop)
-  for (;;) {
-    const candidate = path.join(dir, name)
-    if (await exists(candidate)) return candidate
-    if (dir === root) return undefined
-    const parent = path.dirname(dir)
-    if (parent === dir) return undefined
-    dir = parent
-  }
-}
-
-async function readRule(file: string): Promise<CollectedRule | undefined> {
-  if (!(await exists(file))) return undefined
-  try {
-    const content = await readFile(file, "utf-8")
-    if (!content.trim()) return undefined
-    return { fullPath: path.resolve(file), content }
-  } catch {
-    return undefined
-  }
-}
-
-function globToRegExp(glob: string): RegExp {
-  const norm = glob.replace(/\\/g, "/")
-  let re = "^"
-  for (let i = 0; i < norm.length; i++) {
-    const c = norm[i]!
-    if (c === "*") {
-      if (norm[i + 1] === "*") {
-        re += ".*"
-        i++
-        if (norm[i + 1] === "/") i++
-      } else {
-        re += "[^/]*"
-      }
-    } else if (".$^+?()[]{}|".includes(c) || c === "\\") {
-      re += "\\" + c
-    } else {
-      re += c
-    }
-  }
-  return new RegExp(re + "$")
-}
-
-async function expandGlob(pattern: string, workspaceRoot: string): Promise<string[]> {
-  const abs = path.isAbsolute(pattern) ? pattern : path.join(workspaceRoot, pattern)
-  if (!abs.includes("*")) return (await exists(abs)) ? [abs] : []
-
-  const out: string[] = []
-  const base = abs.split("*")[0] || workspaceRoot
-  const startDir = path.dirname(base.endsWith("/") ? base : base)
-  const regex = globToRegExp(abs)
-
-  async function walk(dir: string, depth: number) {
-    if (depth > 8) return
-    let entries: string[]
-    try {
-      entries = await readdir(dir)
-    } catch {
-      return
-    }
-    entries.sort()
-    for (const name of entries) {
-      if (name === "node_modules" || name === ".git") continue
-      const full = path.join(dir, name)
-      let st
-      try {
-        st = await stat(full)
-      } catch {
-        continue
-      }
-      if (st.isDirectory()) await walk(full, depth + 1)
-      else if (regex.test(full.replace(/\\/g, "/"))) out.push(full)
-    }
-  }
-
-  await walk(startDir, 0)
-  return out
-}
-
 /** Same truthy rule as OpenCode's Flag.OPENCODE_DISABLE_PROJECT_CONFIG. */
 export function isProjectConfigDisabled(): boolean {
   const value = process.env.OPENCODE_DISABLE_PROJECT_CONFIG?.toLowerCase()
   return value === "true" || value === "1"
-}
-
-/** Fetch a remote instruction with one deadline covering headers and body. */
-export async function fetchRemoteInstruction(
-  url: string,
-  timeoutMs = 5000,
-): Promise<string | undefined> {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), Math.max(1, timeoutMs))
-  try {
-    const res = await fetch(url, { signal: ctrl.signal })
-    if (!res.ok) return undefined
-    return await res.text()
-  } catch {
-    return undefined
-  } finally {
-    clearTimeout(timer)
-  }
 }
 
 function mergeConfig(base: OpencodeJson, overlay: OpencodeJson): OpencodeJson {
@@ -168,6 +52,10 @@ function mergeConfig(base: OpencodeJson, overlay: OpencodeJson): OpencodeJson {
   }
 }
 
+/**
+ * Merged `opencode.json` / `opencode.jsonc` for MCP server ids, plugin lists,
+ * and interaction guidance. Instruction file bodies are not collected here.
+ */
 export async function loadMergedConfig(workspaceRoot: string): Promise<OpencodeJson> {
   const globalConfig = await readJsonConfig(opencodeGlobalConfigDirs()[0] ?? "")
   if (isProjectConfigDisabled()) return mergeConfig({}, globalConfig)
@@ -180,72 +68,4 @@ export async function loadMergedConfig(workspaceRoot: string): Promise<OpencodeJ
     projectConfig = mergeConfig(projectConfig, await readJsonConfig(configDir))
   }
   return mergeConfig(globalConfig, projectConfig)
-}
-
-/**
- * Collect OpenCode instruction files.
- * `preloadedConfig` reuses a merged config already loaded on this Run.
- */
-export async function collectRules(
-  workspaceRoot: string,
-  preloadedConfig?: OpencodeJson,
-): Promise<{
-  rules: CollectedRule[]
-  config: OpencodeJson
-  worktree: string
-}> {
-  const worktree = await findGitWorktree(workspaceRoot)
-  const rules: CollectedRule[] = []
-  const seen = new Set<string>()
-  const config = preloadedConfig ?? await loadMergedConfig(workspaceRoot)
-
-  const add = async (file: string | undefined) => {
-    if (!file) return
-    const resolved = path.resolve(file)
-    if (seen.has(resolved)) return
-    const rule = await readRule(resolved)
-    if (!rule) return
-    seen.add(resolved)
-    rules.push(rule)
-  }
-
-  // Match OpenCode: OPENCODE_DISABLE_PROJECT_CONFIG skips project AGENTS/CLAUDE/CONTEXT
-  // discovery and project opencode.json (see loadMergedConfig).
-  if (!isProjectConfigDisabled()) {
-    for (const name of ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]) {
-      const hit = await findUp(name, workspaceRoot, worktree)
-      if (hit) {
-        await add(hit)
-        break
-      }
-    }
-  }
-
-  for (const globalDir of opencodeGlobalConfigDirs()) {
-    await add(path.join(globalDir, "AGENTS.md"))
-  }
-  await add(path.join(homedir(), ".claude", "CLAUDE.md"))
-
-  for (const raw of config.instructions ?? []) {
-    if (raw.startsWith("http://") || raw.startsWith("https://")) {
-      // HTTPS-only. Redirects (incl. to a local proxy) are intentional — do not
-      // disable follow-redirects or reject localhost/private/metadata hosts.
-      let remoteUrl: URL
-      try {
-        remoteUrl = new URL(raw)
-      } catch {
-        continue
-      }
-      if (remoteUrl.protocol !== "https:") continue
-      const content = await fetchRemoteInstruction(remoteUrl.href)
-      if (!content?.trim() || seen.has(raw)) continue
-      seen.add(raw)
-      rules.push({ fullPath: raw, content })
-      continue
-    }
-    const expanded = resolveHomeRelative(raw)
-    for (const m of await expandGlob(expanded, workspaceRoot)) await add(m)
-  }
-
-  return { rules, config, worktree }
 }

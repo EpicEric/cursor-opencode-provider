@@ -6,7 +6,6 @@ import {
   type OpencodeToolDef,
 } from "../protocol/tools.js"
 import {
-  collectRules,
   loadMergedConfig,
   type OpencodeJson,
 } from "./rules.js"
@@ -60,7 +59,6 @@ type AdvertisedSubagentCatalog = {
 
 /**
  * Advertise only what the host `task` / `subagent` catalog already named.
- * Defaults and `collectAgents` file scans are not RequestContext material.
  */
 function buildAdvertisedSubagentCatalog(
   hostSubagents: ReturnType<typeof extractHostSubagentCatalog>,
@@ -76,15 +74,13 @@ function stripHostDuplicatedRequestContextFields(context: Record<string, unknown
 /**
  * Full RequestContext payload for live UMA + exec #10 reply.
  * Workspace env/git/layout plus host-advertised tools and subagents.
- * Honors `instructions` globs the same way OpenCode does. The provider never
- * looks in Cursor's own directories; a `.cursor/` path is read only when the
- * user's own OpenCode config lists it, exactly as the host would read it.
+ * The provider never looks in Cursor's own directories.
  */
 export async function buildRequestContext(
   input: BuildRequestContextInput,
 ): Promise<Record<string, unknown>> {
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
-  const { config } = await collectRules(workspaceRoot, input.mergedConfig)
+  const config = input.mergedConfig ?? await loadMergedConfig(workspaceRoot)
   const [dynamic, git, layout] = await Promise.all([
     buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config),
     collectGit(workspaceRoot),

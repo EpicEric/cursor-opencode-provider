@@ -26,10 +26,10 @@ import { encodeMessage } from "../protocol/messages.js"
  * base plus live plugin/tool overlays. Rebuilding volatile git/layout data on
  * every Run shifts the prompt prefix and tanks prompt-cache hits.
  *
- * Skills, subagents, plugin metadata, and tool/MCP capabilities are rediscovered
- * each Run, then epoch-held (equal ids keep frozen bytes; new ids append) and
- * overlaid on that base. If the encoded overlay bytes did not change, the exact
- * prior materialized object is reused.
+ * Host-advertised subagents, plugin metadata, and tool/MCP capabilities are
+ * rediscovered each Run, then epoch-held (equal ids keep frozen bytes; new ids
+ * append) and overlaid on that base. If the encoded overlay bytes did not
+ * change, the exact prior materialized object is reused.
  */
 
 const byConversationId = new Map<string, Record<string, unknown>>()
