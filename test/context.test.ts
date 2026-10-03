@@ -74,7 +74,7 @@ describe("collectRules / buildRequestContext", () => {
     expect(skills.some((s) => s.name === "demo")).toBe(true)
   })
 
-  it("marks augmented custom subagents complete when the host exposes only string subagent_type", async () => {
+  it("does not invent custom subagents when the host schema has no catalog", async () => {
     const prevCache = process.env.XDG_CACHE_HOME
     const cacheRoot = path.join(os.tmpdir(), `cursor-ctx-agents-string-${process.pid}-${Date.now()}`)
     process.env.XDG_CACHE_HOME = cacheRoot
@@ -94,14 +94,8 @@ describe("collectRules / buildRequestContext", () => {
           },
         }],
       })
-      const subagents = ctx.custom_subagents as Array<Record<string, unknown>>
-      expect(subagents.map((agent) => agent.name)).toEqual(["general", "explore", "reviewer"])
-      expect(String(subagents.find((agent) => agent.name === "reviewer")?.prompt).trim())
-        .toBe("Review carefully.")
-      // The raw host task schema is incomplete (subagent_type is a string, not an
-      // enum), but the provider augments it with defaults plus discovered agents.
-      // This flag describes the final advertised catalog, not the raw host parse.
-      expect(ctx.custom_subagents_info_complete).toBe(true)
+      expect(ctx.custom_subagents).toBeUndefined()
+      expect(ctx.custom_subagents_info_complete).toBe(false)
     } finally {
       if (prevCache === undefined) delete process.env.XDG_CACHE_HOME
       else process.env.XDG_CACHE_HOME = prevCache
@@ -132,8 +126,8 @@ describe("collectRules / buildRequestContext", () => {
       expect(subagents.map((agent) => agent.name)).toEqual([
         "general", "explore", "scout", "reviewer",
       ])
-      expect(String(subagents.find((agent) => agent.name === "reviewer")?.prompt).trim())
-        .toBe("Review carefully.")
+      expect(String(subagents.find((agent) => agent.name === "reviewer")?.prompt))
+        .toContain("host-configured reviewer")
       expect(subagents.find((agent) => agent.name === "scout")?.description)
         .toBe("External dependency research.")
       expect(ctx.custom_subagents_info_complete).toBe(true)
@@ -150,13 +144,14 @@ describe("collectRules / buildRequestContext", () => {
     }
   })
 
-  it("builds an encodable RequestContext with rules and skills", async () => {
+  it("builds an encodable RequestContext without duplicating host rules or skills", async () => {
     const ctx = await buildRequestContext({
       workspaceRoot: root,
       tools: [{ name: "read", description: "Read a file", inputSchema: { type: "object", properties: {} } }],
     })
-    expect(Array.isArray(ctx.rules)).toBe(true)
-    expect((ctx.rules as unknown[]).length).toBeGreaterThan(0)
+    expect(ctx.rules).toBeUndefined()
+    expect(ctx.agent_skills).toBeUndefined()
+    expect(ctx.agent_skills_info_complete).toBeUndefined()
     expect(ctx.rules_info_complete).toBe(true)
     expect(ctx.env_info_complete).toBe(true)
     expect(ctx.web_search_enabled).toBe(false)
@@ -168,7 +163,8 @@ describe("collectRules / buildRequestContext", () => {
     const bytes = encodeMessage("RequestContext", ctx)
     expect(bytes.length).toBeGreaterThan(50)
     const decoded = decodeMessage("RequestContext", bytes) as Record<string, unknown>
-    expect(Array.isArray(decoded.rules)).toBe(true)
+    const decodedRules = decoded.rules
+    expect(decodedRules === undefined || (Array.isArray(decodedRules) && decodedRules.length === 0)).toBe(true)
   })
 
   it("advertises Cursor metadata under ~/.cache/opencode/projects, not the workspace", async () => {

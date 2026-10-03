@@ -174,11 +174,9 @@ import {
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getOrBuildRequestContext } from "./context/frozen.js"
-import { getHeldOverlaySkills } from "./context/overlay.js"
 import { loadMergedConfig } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
-  takeSkillCatalogChangeReminder,
 } from "./context/dynamic-catalog.js"
 import {
   admitContextEpoch,
@@ -1441,19 +1439,9 @@ async function startSession(
     conversationId,
     { workspaceRoot, tools: cursorTools, mergedConfig },
   )
-  // Issue #29: after skills are in RequestContext, admit the catalog. OpenCode
-  // only Mid-Conversation-updates when the available-skills list changes
-  // (SkillGuidance / SkillInstructions) — never per-turn matched-id nudges.
-  // Gate on the host-permitted set, not the epoch-held advertisement.
-  if (!isCompaction && !lifecycle) {
-    const skillDialect = hostToolDialectFromTools(tools, options.defaultDialect)
-    const skillNudge = takeSkillCatalogChangeReminder(conversationId, {
-      hasSkillTool: allowTools && incomingTools.some((tool) => tool.name === "skill"),
-      skills: getHeldOverlaySkills(conversationId),
-      skillArgKey: skillDialect.skillArgKey,
-    })
-    userText = appendMidConversationMessage(userText, skillNudge)
-  }
+  // Skills live in the host system prompt and `skill` tool. Do not scan disk or
+  // emit RequestContext `agent_skills` Mid-Conversation XML; host `<system-update>`
+  // is the catalog-change channel.
   const contextSubagents = Array.isArray(requestContext.custom_subagents)
     ? requestContext.custom_subagents
         .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"

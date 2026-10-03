@@ -367,12 +367,11 @@ describe("frozen request_context", () => {
     expect(empty.context.tools).toBeUndefined()
   })
 
-  it("discovers skill additions and holds removals during a conversation", async () => {
+  it("omits agent_skills from RequestContext when skills appear on disk", async () => {
     const conversationId = "conv-live-skills"
     const skillDir = path.join(root, ".opencode", "skills", "live-skill")
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect((first.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.full_path === path.join(skillDir, "SKILL.md"))).toBe(false)
+    expect(first.context.agent_skills).toBeUndefined()
 
     await mkdir(skillDir, { recursive: true })
     await writeFile(
@@ -380,60 +379,25 @@ describe("frozen request_context", () => {
       "---\nname: live-skill\ndescription: Added during chat\n---\nUse this live skill.\n",
     )
     const added = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(added.reused).toBe(false)
-    expect((added.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
-    const addedSkills = added.context.agent_skills as Array<Record<string, unknown>>
-    expect(addedSkills[addedSkills.length - 1]?.description).toBe("Added during chat")
-
-    const unchanged = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(unchanged.reused).toBe(true)
-    expect(unchanged.context).toBe(added.context)
-
-    await writeFile(
-      path.join(skillDir, "SKILL.md"),
-      "---\nname: live-skill\ndescription: Edited during chat\n---\nChanged body.\n",
-    )
-    const edited = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(edited.reused).toBe(true)
-    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
-    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Edited during chat")).toBe(false)
+    expect(added.context.agent_skills).toBeUndefined()
+    expect(added.context).toBe(first.context)
 
     await rm(skillDir, { recursive: true, force: true })
-    const removed = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(removed.reused).toBe(true)
-    expect((removed.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
   })
 
-  it("appends a skill that sorts earlier instead of inserting it", async () => {
-    const conversationId = "conv-skill-append"
-    const zebraDir = path.join(root, ".opencode", "skills", "zebra-skill")
-    const alphaDir = path.join(root, ".opencode", "skills", "alpha-skill")
-    await mkdir(zebraDir, { recursive: true })
-    await writeFile(
-      path.join(zebraDir, "SKILL.md"),
-      "---\nname: zebra-skill\ndescription: Zebra\n---\nZ.\n",
-    )
-    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    const firstSkills = first.context.agent_skills as Array<Record<string, unknown>>
-    const zebraIndex = firstSkills.findIndex((skill) => skill.description === "Zebra")
-    expect(zebraIndex).toBeGreaterThanOrEqual(0)
-
-    await mkdir(alphaDir, { recursive: true })
-    await writeFile(
-      path.join(alphaDir, "SKILL.md"),
-      "---\nname: alpha-skill\ndescription: Alpha\n---\nA.\n",
-    )
-    const grown = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    const grownSkills = grown.context.agent_skills as Array<Record<string, unknown>>
-    expect(grown.reused).toBe(false)
-    expect(grownSkills.slice(0, firstSkills.length)).toEqual(firstSkills)
-    expect(grownSkills[grownSkills.length - 1]?.description).toBe("Alpha")
-    await rm(alphaDir, { recursive: true, force: true })
-    await rm(zebraDir, { recursive: true, force: true })
+  it("strips rules from a hydrated frozen base", async () => {
+    const conversationId = "conv-strip-rules"
+    setFrozenRequestContext(conversationId, {
+      rules: [{ full_path: "/tmp/AGENTS.md", content: "# leftover" }],
+      agent_skills: [{ full_path: "/tmp/SKILL.md", content: "nope" }],
+      env: { workspace_paths: [root] },
+    })
+    const frozen = getFrozenRequestContext(conversationId)
+    expect(frozen?.rules).toBeUndefined()
+    expect(frozen?.agent_skills).toBeUndefined()
+    const rebuilt = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(rebuilt.context.rules).toBeUndefined()
+    expect(rebuilt.context.agent_skills).toBeUndefined()
   })
 
   it("holds custom subagents when the host omits the executor", async () => {
@@ -446,15 +410,14 @@ describe("frozen request_context", () => {
         properties: {
           description: { type: "string" },
           prompt: { type: "string" },
-          subagent_type: { type: "string" },
+          subagent_type: { type: "string", enum: ["general", "explore"] },
         },
       },
     }]
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
     const firstAgents = (first.context.custom_subagents as Array<Record<string, unknown>>)
       .map((agent) => agent.name)
-    expect(firstAgents).toContain("general")
-    expect(firstAgents).toContain("explore")
+    expect(firstAgents).toEqual(["explore", "general"])
 
     const empty = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
     expect(empty.reused).toBe(false)

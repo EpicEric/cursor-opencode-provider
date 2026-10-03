@@ -94,8 +94,8 @@ function sameIdList(left: readonly string[], right: readonly string[]): boolean 
 /**
  * Shared system-guidance line: name advertised dynamic-catalog tools and prefer
  * them over Grep/Shell when skills or project rules apply. Concrete skill ids
- * stay out of the frozen baseline (they live in RequestContext `agent_skills`
- * and in Mid-Conversation updates when the catalog changes — same split as
+ * stay out of the frozen baseline (they live in the host system prompt / skill
+ * tool, and in host `<system-update>` when the catalog changes — same split as
  * OpenCode's SkillGuidance / SkillInstructions).
  */
 export function buildDynamicCatalogRoutingInstruction(options: {
@@ -124,7 +124,7 @@ export function buildDynamicCatalogRoutingInstruction(options: {
     lines.push(
       "- Skills provide specialized instructions and workflows for specific tasks. " +
         "Use the `skill` tool to load a skill when a task matches its description " +
-        "(RequestContext `agent_skills` lists names and descriptions). " +
+        "(the host system prompt and `skill` tool carry names and descriptions). " +
         "A skill that is already present in the conversation as a `<skill_content>` block " +
         "does not need to be invoked again.",
     )
