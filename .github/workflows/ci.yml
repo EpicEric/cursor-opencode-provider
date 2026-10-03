@@ -1,0 +1,51 @@
+# PR / main CI: typecheck, unit tests, and a post-build architecture scan.
+# Release publish (v* tags) stays in publish.yml.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # OpenCode's default interactive shell is zsh; shell-timeout's ZDOTDIR
+      # injector integration test needs /bin/zsh (absent on stock ubuntu-latest).
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      # architecture.test.ts skips dist/ when it is absent; re-run after tsc.
+      - name: Architecture checks on dist
+        run: bun test test/architecture.test.ts
+
+      - name: Node HTTP/2 cleanup
+        run: bun run test:node-http2
+
+      - name: Check pricing coverage
+        run: bun run check:pricing
