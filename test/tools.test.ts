@@ -396,6 +396,16 @@ describe("toolsToMcpDescriptors", () => {
   it("returns no descriptors for an empty tool list", () => {
     expect(toolsToMcpDescriptors([])).toEqual([])
   })
+
+  it("namesOnly omits description and schema", () => {
+    const d = toolsToMcpDescriptors(
+      [{ name: "read", description: "Read a file", inputSchema: { type: "object" } }],
+      "opencode",
+      [],
+      { namesOnly: true },
+    )
+    expect(d[0]!.tools).toEqual([{ tool_name: "read" }])
+  })
 })
 
 describe("mcpRealToolName", () => {
@@ -3243,7 +3253,7 @@ describe("exec safety net (unmapped variants)", () => {
     }
   })
 
-  it("decodes field #36 as mcp_state and replies from advertised descriptors", () => {
+  it("decodes field #36 as mcp_state and replies from the live host catalog", () => {
     const args: number[] = []
     const server = new TextEncoder().encode("github")
     const writeVarint = (n: number) => {
@@ -3263,22 +3273,11 @@ describe("exec safety net (unmapped variants)", () => {
     const response = buildMcpStateResult(
       decoded.exec_server_message.id,
       decoded.exec_server_message.mcp_state_exec_args,
-      {
-        mcp_file_system_options: {
-          mcp_descriptors: [
-            {
-              server_name: "opencode",
-              server_identifier: "opencode",
-              tools: [{ tool_name: "write", description: "Write" }],
-            },
-            {
-              server_name: "github",
-              server_identifier: "github",
-              tools: [{ tool_name: "get_me", description: "Who am I" }],
-            },
-          ],
-        },
-      },
+      [
+        { name: "write", description: "Write", inputSchema: { type: "object" } },
+        { name: "github_get_me", description: "Who am I", inputSchema: { type: "object" } },
+      ],
+      ["github"],
     )
     const result = decodeMessage<any>("AgentClientMessage", response)
       .exec_client_message.mcp_state_exec_result.success
@@ -3304,12 +3303,8 @@ describe("exec safety net (unmapped variants)", () => {
     const response = buildMcpStateResult(
       69,
       { server_identifiers: ["github"] },
-      {
-        tools: toolsToDescriptors(tools, "opencode", ["github"]),
-        mcp_file_system_options: {
-          mcp_descriptors: toolsToMcpDescriptors(tools, "opencode", ["github"]),
-        },
-      },
+      tools,
+      ["github"],
     )
 
     const decoded = decodeCanonicalMcpStateResult(response)
@@ -3324,6 +3319,32 @@ describe("exec safety net (unmapped variants)", () => {
     expect(server.tools[0].provider_identifier).toBe("github")
     expect(server.tools[0].tool_name).toBe("create_pull_request")
     expect(server.tools[0].input_schema.length).toBeGreaterThan(0)
+  })
+
+  it("answers exec #36 from the live catalog, not a frozen RequestContext", () => {
+    const frozen = {
+      tools: toolsToDescriptors(
+        [{ name: "read", description: "Read", inputSchema: { type: "object" } }],
+        "opencode",
+        ["abmcp"],
+      ),
+    }
+    const live = [
+      { name: "read", description: "Read", inputSchema: { type: "object" } },
+      {
+        name: "abmcp_ab_secret",
+        description: "Return the MCP secret",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]
+    const response = buildMcpStateResult(7, {}, live, ["abmcp"])
+    const result = decodeMessage<any>("AgentClientMessage", response)
+      .exec_client_message.mcp_state_exec_result.success
+    const names = result.servers.flatMap((s: { tools: Array<{ tool_name: string }> }) =>
+      s.tools.map((t) => t.tool_name),
+    )
+    expect(names).toContain("ab_secret")
+    expect(frozen.tools.map((t: { tool_name: string }) => t.tool_name)).not.toContain("ab_secret")
   })
 
   it("buildRequestContextResult encodes a prebuilt request_context", () => {

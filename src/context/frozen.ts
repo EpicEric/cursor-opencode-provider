@@ -150,6 +150,20 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true
 }
 
+function advertisedMetaToolCount(context: Record<string, unknown>): number {
+  const meta = context.mcp_meta_tool_options
+  if (!meta || typeof meta !== "object") return 0
+  const descriptors = (meta as { mcp_descriptors?: unknown }).mcp_descriptors
+  if (!Array.isArray(descriptors)) return 0
+  let count = 0
+  for (const descriptor of descriptors) {
+    if (!descriptor || typeof descriptor !== "object") continue
+    const tools = (descriptor as { tools?: unknown }).tools
+    if (Array.isArray(tools)) count += tools.length
+  }
+  return count
+}
+
 function rememberMaterialized(
   conversationId: string,
   context: Record<string, unknown>,
@@ -189,7 +203,7 @@ export async function getOrBuildRequestContext(
       )
       trace(
         `request_context: materialized conversationId=${conversationId} ` +
-          `tools=${Array.isArray(materialized.context.tools) ? materialized.context.tools.length : 0} ` +
+          `tools=${advertisedMetaToolCount(materialized.context)} ` +
           `reused=${materialized.reused}`,
       )
       return materialized
@@ -224,7 +238,7 @@ export async function getOrBuildRequestContext(
     : { context: freezeSnapshot(structuredClone(context)), reused: false }
   trace(
     `request_context: built+frozen conversationId=${conversationId || "(none)"} ` +
-      `tools=${Array.isArray(materialized.context.tools) ? materialized.context.tools.length : 0} ` +
+      `tools=${advertisedMetaToolCount(materialized.context)} ` +
       `refresh=${!!opts?.refresh}`,
   )
   return { context: materialized.context, reused: false }

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "bun:test"
 import { buildRunRequest, buildHeartbeat } from "../src/protocol/request.js"
 import { buildLiveRequestContext } from "../src/protocol/tools.js"
-import { decodeMessage } from "../src/protocol/messages.js"
+import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { decodeFramePayload, streamFrames } from "../src/protocol/framing.js"
 import { gunzipSync } from "node:zlib"
 import { readAllFields } from "../src/protocol/struct.js"
@@ -88,7 +88,7 @@ describe("buildRunRequest", () => {
     expect(decoded.run_request.conversation_group_id).toBe("standalone-conversation")
   })
 
-  it("injects opencode tools into AgentRunRequest #4 mcp_tools", () => {
+  it("does not populate AgentRunRequest #4 mcp_tools", () => {
     const data = buildRunRequest({
       text: "hi",
       modelId: "claude-opus-4-8",
@@ -99,16 +99,10 @@ describe("buildRunRequest", () => {
       ],
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
-    const descriptors = decoded.run_request.mcp_tools?.mcp_tools
-    expect(descriptors).toHaveLength(2)
-    const read = descriptors.find((tool: { tool_name: string }) => tool.tool_name === "read")
-    expect(read.name).toBe("opencode-read")
-    expect(read.provider_identifier).toBe("opencode")
-    expect(read.description).toBe("Read a file")
-    expect(read.input_schema.length).toBeGreaterThan(0)
+    expect(decoded.run_request.mcp_tools?.mcp_tools ?? []).toHaveLength(0)
   })
 
-  it("advertises tools on the LIVE request_context path (not only prewarm #4)", () => {
+  it("advertises slim tool names on LIVE request_context, not #7 or fs descriptors", () => {
     const tools = [
       { name: "read", description: "Read", inputSchema: { type: "object", properties: { filePath: { type: "string" } }, required: ["filePath"] } },
       { name: "bash", description: "Shell", inputSchema: { type: "object", properties: { command: { type: "string" } } } },
@@ -125,26 +119,25 @@ describe("buildRunRequest", () => {
     expect(rc).toBeDefined()
     expect(rc.web_search_enabled).toBe(false)
     expect(rc.web_fetch_enabled).toBe(false)
-    // Flat list at RequestContext.tools (#7) — what the CLI historically used.
-    expect(rc.tools).toHaveLength(2)
-    const read = rc.tools.find((tool: { tool_name: string }) => tool.tool_name === "read")
-    expect(read.name).toBe("opencode-read")
-    expect(read.input_schema.length).toBeGreaterThan(0)
-    // Nested IDE path at #23 mcp_file_system_options.
+    expect(rc.tools ?? []).toHaveLength(0)
+    expect(decoded.run_request.mcp_tools?.mcp_tools ?? []).toHaveLength(0)
     const fsOpts = rc.mcp_file_system_options
     expect(fsOpts.enabled).toBe(true)
-    expect(fsOpts.mcp_descriptors).toHaveLength(1)
-    expect(fsOpts.mcp_descriptors[0].server_identifier).toBe("opencode")
-    expect(fsOpts.mcp_descriptors[0].tools).toHaveLength(2)
-    expect(fsOpts.mcp_descriptors[0].tools.map((tool: { tool_name: string }) => tool.tool_name)).toEqual([
+    expect(fsOpts.mcp_descriptors ?? []).toHaveLength(0)
+    const metaTools = rc.mcp_meta_tool_options.mcp_descriptors[0].tools
+    expect(metaTools).toHaveLength(2)
+    expect(metaTools.map((tool: { tool_name: string }) => tool.tool_name)).toEqual([
       "read",
       "bash",
     ])
-    // Meta-tool options (#34) also populated.
-    expect(rc.mcp_meta_tool_options.mcp_descriptors[0].tools).toHaveLength(2)
+    const metaBytes = encodeMessage("RequestContext", buildLiveRequestContext(tools))
+    const metaOpts = readAllFields(metaBytes).find((field) => field.fn === 34)?.bytes
+    const descriptor = readAllFields(metaOpts!).find((field) => field.fn === 2)?.bytes
+    const tool = readAllFields(descriptor!).find((field) => field.fn === 5)?.bytes
+    expect(readAllFields(tool!).map((field) => field.fn)).toEqual([1])
   })
 
-  it("splits LIVE mcp_descriptors by real MCP server", () => {
+  it("splits LIVE mcp_meta descriptors by real MCP server", () => {
     const tools = [
       { name: "read", description: "Read", inputSchema: { type: "object" } },
       {
@@ -160,23 +153,13 @@ describe("buildRunRequest", () => {
       modelId: "m",
       conversationId: "c-split",
       tools,
-      toolDescriptors: requestContext.tools as Array<Record<string, unknown>>,
       requestContext,
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
     const rc = decoded.run_request.action.user_message_action.request_context
-    const flat = rc.tools
-    expect(flat.map((t: any) => t.name)).toEqual([
-      "opencode-read",
-      "github-create_pull_request",
-      "brave-web_search",
-    ])
-    expect(flat.map((t: any) => t.provider_identifier)).toEqual([
-      "opencode",
-      "github",
-      "brave",
-    ])
-    const descriptors = rc.mcp_file_system_options.mcp_descriptors
+    expect(rc.tools ?? []).toHaveLength(0)
+    expect(rc.mcp_file_system_options.mcp_descriptors ?? []).toHaveLength(0)
+    const descriptors = rc.mcp_meta_tool_options.mcp_descriptors
     expect(descriptors.map((d: any) => d.server_identifier)).toEqual([
       "opencode",
       "github",

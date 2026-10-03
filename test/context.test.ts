@@ -209,12 +209,17 @@ describe("collectRules / buildRequestContext", () => {
         { name: "custom_helper" },
       ],
     })
-    const tools = ctx.tools as Array<Record<string, unknown>>
-    expect(tools.map((tool) => [tool.provider_identifier, tool.tool_name])).toEqual([
+    const tools = ctx.mcp_meta_tool_options as {
+      mcp_descriptors: Array<{ server_identifier: string; tools: Array<{ tool_name: string }> }>
+    }
+    expect(tools.mcp_descriptors.flatMap((descriptor) =>
+      descriptor.tools.map((tool) => [descriptor.server_identifier, tool.tool_name]),
+    )).toEqual([
       ["github", "create_pull_request"],
       ["my_server", "lookup"],
       ["opencode", "custom_helper"],
     ])
+    expect(ctx.tools).toBeUndefined()
   })
 })
 

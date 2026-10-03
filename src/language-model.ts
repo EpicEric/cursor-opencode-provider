@@ -33,6 +33,7 @@ import {
   buildReadMcpResourceFallback,
   buildCustomWebToolAliases,
   extractHostSubagentCatalog,
+  toolsToDescriptors,
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
   preferCorrelatedTaskDescription,
@@ -805,6 +806,7 @@ async function doStreamImpl(
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
     session = deliverContinuationResults(session, trailingToolResults)
+    if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
 
   if (!session) {
@@ -1471,11 +1473,9 @@ async function startSession(
         .map((agent) => [agent.name, agent]),
     ).values()],
   }
-  // Resolve descriptors once from the merged OpenCode config so MCP identity is
-  // consistent across AgentRunRequest and both request_context reply paths.
-  const toolDescriptors = Array.isArray(requestContext.tools)
-    ? requestContext.tools as Array<Record<string, unknown>>
-    : []
+  // Session exec remap / bridges need full McpToolDefinition identity. The wire
+  // omits RequestContext.tools (#7); do not read descriptors from there.
+  const toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
   // CLI parity: echo the last conversation_checkpoint_update as conversation_state.
   // After compaction or an unsafe checkpoint reset there is no checkpoint —
   // seed a new Cursor conversation from OpenCode's authoritative history.
@@ -1601,6 +1601,7 @@ async function startSession(
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
     toolCatalog: snapshotToolCatalog(sessionKey),
+    knownMcpServers,
     stream,
     frames: stream.frames()[Symbol.asyncIterator](),
     pending: new Map(),
@@ -3462,8 +3463,9 @@ export async function pump(
         }
       } else if (esm.mcp_state_exec_args) {
         // MCP-backed writes/reads can be preceded by this control-plane probe.
-        // Confirm the virtual servers from the already-advertised context, then
-        // keep pumping until Cursor emits the actual mcp_args tool request.
+        // Confirm servers from the live host catalog (refreshed on each
+        // doStream, including continuation), then keep pumping until Cursor
+        // emits the actual mcp_args tool request.
         const stateArgs = esm.mcp_state_exec_args as Record<string, unknown>
         const requested = Array.isArray(stateArgs.server_identifiers)
           ? stateArgs.server_identifiers.join(",")
@@ -3471,7 +3473,12 @@ export async function pump(
         try {
           await writeWithBackpressure(
             session.stream,
-            buildMcpStateResult(esmId, stateArgs, session.requestContext),
+            buildMcpStateResult(
+              esmId,
+              stateArgs,
+              session.toolCatalog ?? [],
+              session.knownMcpServers ?? [],
+            ),
             `MCP-state reply id=${esmId}`,
           )
           trace(`exec mcp_state: replied id=${esmId} requested=[${requested}]`)
@@ -4630,6 +4637,72 @@ export function resolveConversationId(callOptions: LanguageModelV3CallOptions): 
 }
 
 export { sessionIdToUuid } from "./protocol/conversation-bind.js"
+
+/**
+ * Grow the held Run's advertised + permitted catalog from this `doStream`
+ * call. Continuation skips `startSession`, so without this, exec #36 and
+ * permission keep the freeze from Run open.
+ */
+export async function refreshHeldSessionToolCatalog(
+  session: CursorSession,
+  callOptions: LanguageModelV3CallOptions,
+): Promise<void> {
+  const sessionKey = session.openCodeSessionId
+  const incomingTools = extractTools(callOptions)
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
+  const isCompaction = compactionOption === true || (
+    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
+  )
+  const toolState = await resolveTurnToolState({
+    sessionKey,
+    incomingTools,
+    toolChoice: callOptions.toolChoice,
+    isCompaction,
+    abortSignal: callOptions.abortSignal,
+  })
+  const webToolAliases = buildCustomWebToolAliases(toolState.advertisedTools)
+  const cursorTools = webToolAliases.advertisedTools
+  const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
+  const mergedConfig = isCompaction ? undefined : await loadMergedConfig(workspaceRoot)
+  const knownMcpServers = [...new Set([
+    ...(session.knownMcpServers ?? []),
+    ...Object.keys(mergedConfig?.mcp ?? {}),
+  ])]
+  const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
+  const contextSubagents = Array.isArray(session.requestContext.custom_subagents)
+    ? session.requestContext.custom_subagents
+        .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"
+          ? {
+              name: (agent as Record<string, unknown>).name as string,
+              description: typeof (agent as Record<string, unknown>).description === "string"
+                ? (agent as Record<string, unknown>).description as string
+                : undefined,
+            }
+          : undefined)
+        .filter((agent): agent is { name: string; description: string | undefined } => !!agent)
+    : []
+  session.knownMcpServers = knownMcpServers
+  session.toolCatalog = sessionKey
+    ? snapshotToolCatalog(sessionKey)
+    : structuredClone(toolState.advertisedTools)
+  session.toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
+  session.toolAliases = webToolAliases.aliases
+  session.hostToolDialect = hostToolDialectFromTools(cursorTools, session.hostToolDialect)
+  session.subagentCatalog = {
+    ...discoveredSubagentCatalog,
+    agents: [...new Map(
+      [...discoveredSubagentCatalog.agents, ...contextSubagents]
+        .map((agent) => [agent.name, agent]),
+    ).values()],
+  }
+  session.allowTools = toolState.allowTools
+  session.permittedToolNames = new Set(
+    toolState.allowTools
+      ? incomingTools.map((tool) => tool.name).filter((name): name is string => !!name)
+      : [],
+  )
+}
 
 function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[] {
   const tools = callOptions.tools

@@ -1350,8 +1350,8 @@ export function createMessageTypes(): protobuf.Root {
   ])
 
   // Cursor probes MCP server availability before emitting an MCP-backed tool
-  // call. OpenCode owns those servers, so answer from the descriptors already
-  // advertised in RequestContext rather than surfacing this as a user tool.
+  // call. OpenCode owns those servers, so answer from the live host catalog
+  // rather than surfacing this as a user tool.
   addType(root, "McpStateExecArgs", [
     { id: 1, name: "server_identifiers", type: "string", repeated: true },
     { id: 2, name: "kick_only", type: "bool" },
@@ -1569,8 +1569,8 @@ export function createMessageTypes(): protobuf.Root {
     { id: 3, name: "selected_context", type: "SelectedContext" },
   ])
 
-  // RequestContext — UserMessageAction #2. Live per-turn tools go here
-  // (AgentRunRequest.mcp_tools #4 is prewarm-only / empty on real turns).
+  // RequestContext — UserMessageAction #2. Slim mcp_meta_tool_options names
+  // the advertised catalog; AgentRunRequest.mcp_tools (#4) is empty on real turns.
   addType(root, "RequestContext", [
     { id: 2, name: "rules", type: "CursorRule", repeated: true },
     { id: 4, name: "env", type: "RequestContextEnv" },

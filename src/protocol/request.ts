@@ -1,5 +1,5 @@
 import { encodeMessage, getMessageTypes } from "./messages.js"
-import { toolsToDescriptors, type OpencodeToolDef } from "./tools.js"
+import type { OpencodeToolDef } from "./tools.js"
 import type { CursorImageInput } from "../image-input.js"
 
 export type SeedHistoryMessage = {
@@ -84,11 +84,9 @@ export function buildSeedConversationState(input?: {
 export function buildRunRequest(input: RunRequestInput): Uint8Array {
   const msgId = input.messageId ?? crypto.randomUUID()
 
-  // Advertise opencode's tools on the LIVE path: UserMessageAction.request_context
-  // (#2). AgentRunRequest.mcp_tools (#4) is prewarm-only / empty on real turns —
-  // putting tools only there is why the model fell back to native Grep/Read.
-  const tools = input.tools ?? []
-  const mcpTools = input.toolDescriptors ?? (tools.length > 0 ? toolsToDescriptors(tools) : [])
+  // Advertise host tools on UserMessageAction.request_context (#2) via slim
+  // mcp_meta_tool_options. AgentRunRequest.mcp_tools (#4) stays empty on real
+  // turns (CLI prewarm-only). Full defs are session.toolDescriptors + exec #36.
   const requestContext = input.requestContext
 
   const userMessage: Record<string, unknown> = {
@@ -133,9 +131,7 @@ export function buildRunRequest(input: RunRequestInput): Uint8Array {
       parameters: input.parameterValues ?? [],
     },
     conversation_state: conversationState,
-    // Keep #4 populated too (harmless on real turns; useful for prewarm /
-    // older server builds that still read it).
-    mcp_tools: { mcp_tools: mcpTools },
+    mcp_tools: { mcp_tools: [] },
     unknown_flag: 0,
     field_12: 0,
   }

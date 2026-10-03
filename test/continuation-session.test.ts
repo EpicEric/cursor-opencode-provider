@@ -3,10 +3,11 @@ import fs from "node:fs"
 import path from "node:path"
 import type { LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { sessionManager, type CursorSession } from "../src/session.js"
-import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
+import { findContinuationSession, deliverContinuationResults, extractTrailingToolResults, hasApprovedUncorrelatedPlanStageResult, rememberMirroredTodos, refreshHeldSessionToolCatalog, resetTurnStateForTests, snapshotMirroredTodosBySession } from "../src/language-model.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { decodeMessage } from "../src/protocol/messages.js"
 import { CREATE_PLAN_RESULT_FIELD } from "../src/protocol/create-plan.js"
+import { decodeMessage } from "../src/protocol/messages.js"
+import { buildMcpStateResult } from "../src/protocol/tools.js"
 import { getActiveCursorMode, setActiveCursorMode } from "../src/protocol/switch-mode.js"
 import {
   captureCursorShellResult,
@@ -501,5 +502,41 @@ describe("deliverContinuationResults", () => {
       { id: "1", content: "from host", status: "completed", priority: "high" },
       { id: "2", content: "still open", status: "pending", priority: "medium" },
     ])
+  })
+})
+
+describe("refreshHeldSessionToolCatalog", () => {
+  it("makes tools added after Run open appear in the next exec #36 reply", async () => {
+    const live = fakeSession("mcp-grow")
+    live.openCodeSessionId = "ses_mcp_grow"
+    live.knownMcpServers = ["abmcp"]
+    live.toolCatalog = [{ name: "read", description: "Read", inputSchema: { type: "object" } }]
+    live.requestContext = {
+      tools: [{ tool_name: "read" }],
+      env: { workspace_paths: [process.cwd()] },
+    }
+    const schema = { type: "object", properties: {} }
+    await refreshHeldSessionToolCatalog(live, {
+      prompt: [],
+      tools: [
+        { type: "function", name: "read", description: "Read", inputSchema: schema },
+        { type: "function", name: "abmcp_ab_secret", description: "Secret", inputSchema: schema },
+      ],
+    } as LanguageModelV3CallOptions)
+
+    expect(live.toolCatalog?.map((tool) => tool.name)).toContain("abmcp_ab_secret")
+    expect(live.permittedToolNames?.has("abmcp_ab_secret")).toBe(true)
+    expect(live.toolDescriptors.some((tool) => tool.tool_name === "ab_secret")).toBe(true)
+    expect((live.requestContext.tools as Array<{ tool_name: string }>).map((tool) => tool.tool_name))
+      .toEqual(["read"])
+
+    const result = decodeMessage<{
+      exec_client_message: {
+        mcp_state_exec_result: { success: { servers: Array<{ tools: Array<{ tool_name: string }> }> } }
+      }
+    }>("AgentClientMessage", buildMcpStateResult(3, {}, live.toolCatalog ?? [], live.knownMcpServers ?? []))
+      .exec_client_message.mcp_state_exec_result.success
+    expect(result.servers.flatMap((server) => server.tools.map((tool) => tool.tool_name)))
+      .toContain("ab_secret")
   })
 })

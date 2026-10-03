@@ -1,7 +1,6 @@
 import path from "node:path"
 import {
   extractHostSubagentCatalog,
-  toolsToDescriptors,
   toolsToMcpDescriptors,
   type HostSubagentDefinition,
   type OpencodeToolDef,
@@ -148,8 +147,7 @@ async function buildDynamicRequestContextFromDiscovery(
   ])
 
   const mcpServerNames = Object.keys(config.mcp ?? {})
-  const flat = toolsToDescriptors(tools, providerIdentifier, mcpServerNames)
-  const nested = toolsToMcpDescriptors(tools, providerIdentifier, mcpServerNames)
+  const slim = toolsToMcpDescriptors(tools, providerIdentifier, mcpServerNames, { namesOnly: true })
   const projectDir = ensureOpencodeProjectDir(workspaceRoot)
   const hostSubagents = extractHostSubagentCatalog(tools)
   const advertisedSubagents = buildAdvertisedSubagentCatalog(hostSubagents, agents)
@@ -189,18 +187,16 @@ async function buildDynamicRequestContextFromDiscovery(
     : { skills: liveSkills.map(({ full_path, content, description }) => ({ full_path, content, description })), subagents: customSubagents, plugins: livePlugins }
 
   const dynamic: Record<string, unknown> = {
-    tools: flat,
     agent_skills: overlay.skills,
     custom_subagents: overlay.subagents,
     mcp_file_system_options: {
       enabled: true,
       // Cursor metadata root (mcps / agent-tools), not the git workspace.
       workspace_project_dir: projectDir,
-      mcp_descriptors: nested,
     },
     mcp_meta_tool_options: {
       enabled: true,
-      mcp_descriptors: nested,
+      ...(slim.length > 0 ? { mcp_descriptors: slim } : {}),
     },
     // This provider always rejects native web_search/web_fetch interaction
     // queries with a headless-UI reason (see interactions.ts). Advertise that
