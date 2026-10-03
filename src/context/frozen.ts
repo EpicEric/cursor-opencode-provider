@@ -3,6 +3,7 @@ import {
   buildRequestContext,
   materializeRequestContext,
   requestContextBase,
+  withSystemInstructions,
   type BuildRequestContextInput,
 } from "./build.js"
 import { clearContextEpoch, endContextEpoch, resetContextEpochsForTests } from "./epoch.js"
@@ -11,11 +12,6 @@ import {
   resetOverlayHoldsForTests,
   transferOverlayHold,
 } from "./overlay.js"
-import {
-  clearSkillCatalogAdmission,
-  resetSkillCatalogAdmissionsForTests,
-  transferSkillCatalogAdmission,
-} from "./dynamic-catalog.js"
 import { trace } from "../debug.js"
 import { encodeMessage } from "../protocol/messages.js"
 
@@ -26,10 +22,10 @@ import { encodeMessage } from "../protocol/messages.js"
  * base plus live plugin/tool overlays. Rebuilding volatile git/layout data on
  * every Run shifts the prompt prefix and tanks prompt-cache hits.
  *
- * Skills, subagents, plugin metadata, and tool/MCP capabilities are rediscovered
- * each Run, then epoch-held (equal ids keep frozen bytes; new ids append) and
- * overlaid on that base. If the encoded overlay bytes did not change, the exact
- * prior materialized object is reused.
+ * Host-advertised subagents, plugin metadata, and tool/MCP capabilities are
+ * rediscovered each Run, then epoch-held (equal ids keep frozen bytes; new ids
+ * append) and overlaid on that base. If the encoded overlay bytes did not
+ * change, the exact prior materialized object is reused.
  */
 
 const byConversationId = new Map<string, Record<string, unknown>>()
@@ -62,7 +58,6 @@ function remember(conversationId: string, context: Record<string, unknown>): voi
     byConversationId.delete(oldest)
     materializedByConversationId.delete(oldest)
     clearOverlayHold(oldest)
-    clearSkillCatalogAdmission(oldest)
   }
 }
 
@@ -92,7 +87,6 @@ export function clearFrozenRequestContext(conversationId: string): void {
   byConversationId.delete(conversationId)
   materializedByConversationId.delete(conversationId)
   clearOverlayHold(conversationId)
-  clearSkillCatalogAdmission(conversationId)
   clearContextEpoch(conversationId)
 }
 
@@ -113,12 +107,11 @@ export function transferFrozenRequestContext(
   const base = byConversationId.get(previousConversationId)
   const materialized = materializedByConversationId.get(previousConversationId)
   // System Context epoch does not transfer — compaction starts a fresh baseline.
-  // Overlay hold does transfer: same workspace, same advertised skill/agent/plugin
+  // Overlay hold does transfer: same workspace, same advertised agent/plugin
   // bytes, so the comparison seed can still match. clearFrozenRequestContext
   // also drops epoch state for each id.
   endContextEpoch(previousConversationId, nextConversationId)
   transferOverlayHold(previousConversationId, nextConversationId)
-  transferSkillCatalogAdmission(previousConversationId, nextConversationId)
   byConversationId.delete(previousConversationId)
   materializedByConversationId.delete(previousConversationId)
   byConversationId.delete(nextConversationId)
@@ -140,7 +133,6 @@ export function resetFrozenRequestContextsForTests(): void {
   materializedByConversationId.clear()
   buildsByConversationId.clear()
   resetOverlayHoldsForTests()
-  resetSkillCatalogAdmissionsForTests()
   resetContextEpochsForTests()
 }
 
@@ -148,6 +140,20 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
   return true
+}
+
+function advertisedMetaToolCount(context: Record<string, unknown>): number {
+  const meta = context.mcp_meta_tool_options
+  if (!meta || typeof meta !== "object") return 0
+  const descriptors = (meta as { mcp_descriptors?: unknown }).mcp_descriptors
+  if (!Array.isArray(descriptors)) return 0
+  let count = 0
+  for (const descriptor of descriptors) {
+    if (!descriptor || typeof descriptor !== "object") continue
+    const tools = (descriptor as { tools?: unknown }).tools
+    if (Array.isArray(tools)) count += tools.length
+  }
+  return count
 }
 
 function rememberMaterialized(
@@ -180,8 +186,21 @@ export async function getOrBuildRequestContext(
   const scoped = conversationId ? { ...input, conversationId } : input
   if (opts?.refresh && conversationId) clearOverlayHold(conversationId)
   if (!opts?.refresh && conversationId) {
-    const base = getFrozenRequestContext(conversationId)
+    let base = getFrozenRequestContext(conversationId)
     if (base) {
+      // The system-instructions rule is frozen with the base. A new epoch
+      // baseline (compaction rebase, binding reset) replaces it; a recovered
+      // epoch only fills a base persisted without one.
+      const instructed = withSystemInstructions(base, input.systemInstructions)
+      if (instructed !== base) {
+        setFrozenRequestContext(conversationId, instructed)
+        base = getFrozenRequestContext(conversationId)!
+        trace(
+          `request_context: system instructions frozen conversationId=${conversationId} ` +
+            `len=${input.systemInstructions?.text.length ?? 0} ` +
+            `authoritative=${input.systemInstructions?.authoritative ?? false}`,
+        )
+      }
       const dynamic = await buildDynamicRequestContext(scoped)
       const materialized = rememberMaterialized(
         conversationId,
@@ -189,7 +208,7 @@ export async function getOrBuildRequestContext(
       )
       trace(
         `request_context: materialized conversationId=${conversationId} ` +
-          `tools=${Array.isArray(materialized.context.tools) ? materialized.context.tools.length : 0} ` +
+          `tools=${advertisedMetaToolCount(materialized.context)} ` +
           `reused=${materialized.reused}`,
       )
       return materialized
@@ -224,7 +243,7 @@ export async function getOrBuildRequestContext(
     : { context: freezeSnapshot(structuredClone(context)), reused: false }
   trace(
     `request_context: built+frozen conversationId=${conversationId || "(none)"} ` +
-      `tools=${Array.isArray(materialized.context.tools) ? materialized.context.tools.length : 0} ` +
+      `tools=${advertisedMetaToolCount(materialized.context)} ` +
       `refresh=${!!opts?.refresh}`,
   )
   return { context: materialized.context, reused: false }

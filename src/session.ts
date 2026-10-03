@@ -224,8 +224,14 @@ export type CursorSession = {
   checkpointRebaseEligible?: boolean
   /** Completed compaction must rebase once before resuming a normal agent. */
   postCompactionRebase?: boolean
-  /** Last real host catalog, retained only as a lifecycle-turn fallback. */
+  /**
+   * Epoch-held host catalog for this OpenCode session. Refreshed on every
+   * `doStream` (including held-Run continuation) so exec #36 and permission
+   * can see tools that connected after Run open. Also the lifecycle-turn fallback.
+   */
   toolCatalog?: OpencodeToolDef[]
+  /** Configured MCP server ids used to split flattened host tool names. */
+  knownMcpServers?: string[]
   stream: BidiStream
   frames: AsyncIterator<Frame>
   pending: Map<number, PendingExec>

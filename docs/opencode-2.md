@@ -160,13 +160,13 @@ Generated-image saving remains available through the classic plugin/OCP surfaces
 
 ## Planning and prompt ownership
 
-OpenCode 2 owns its full system prompt and its vendor-maintained Plan agent. The provider forwards the host prompt; it does not copy or replace the 2.0 prompt templates. Provider-added guidance is limited to protocol facts the host cannot know, such as Cursor interaction bridging and the advertised direct tool catalog.
+OpenCode 2 owns its full system prompt and its vendor-maintained Plan agent. The provider forwards the host prompt verbatim as Cursor's always-apply system-instructions rule (Cursor does not follow a client-seeded `system` message); it does not copy or replace the 2.0 prompt templates. Provider-added guidance is limited to protocol facts the host cannot know, such as Cursor interaction bridging and the advertised direct tool catalog.
 
 MCP tools whose server did not set `"codemode": true` are on the direct catalog and are called by name. `execute` remains Code Mode for tools that are still absent from that list, including an explicit `"codemode": true` server and OpenCode's own Code Mode tools. Cursor calls `execute` with `{ code }` and uses the exact paths and signatures from the host Code Mode catalog (or its `search` function). OpenCode still applies its own tool availability and permission checks when `execute` runs.
 
 When Cursor raises SwitchMode for `plan` or `spec`, the plugin selects OpenCode 2's `plan` primary agent after the current Cursor Run has safely ended. Approved non-plan targets select `build`; when no native `plan_exit` tool exists, the advertised `question` tool remains the user-visible approval gate. A user switching agents in the OpenCode UI follows the same state path because `session.hook("context")` carries the active agent into the provider.
 
-A Cursor checkpoint embeds the earlier prompt state. Reusing it after an OpenCode agent or stable system-prompt change would bypass the new Plan restrictions, so the provider persists the host agent and prompt hash and rotates/reseeds the Cursor conversation when either changes. Ephemeral title/generation calls do not alter that identity. This reset is intentional: a changed system prompt cannot share the old prompt prefix safely.
+An OpenCode agent or system-prompt change keeps the sticky Cursor conversation, as Cursor CLI keeps its conversation across mode flips. The conversation's first system context stays frozen as the system-instructions rule, so the prompt cache survives; the new agent and the changed host instructions arrive as a Mid-Conversation System Message on the next user turn, which the model follows. The host agent and prompt hash are persisted with the checkpoint for diagnostics only. Ephemeral title/generation calls do not alter that identity.
 
 ## Safe transition
 

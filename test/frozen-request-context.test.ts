@@ -4,6 +4,8 @@ import path from "node:path"
 import os from "node:os"
 import { createHash } from "node:crypto"
 import { buildRequestContextResult } from "../src/protocol/tools.js"
+import { decodeMessage } from "../src/protocol/messages.js"
+import { SYSTEM_INSTRUCTIONS_RULE_PATH } from "../src/context/build.js"
 import {
   clearFrozenRequestContext,
   getFrozenRequestContext,
@@ -37,6 +39,34 @@ function sha(bytes: Uint8Array): string {
 /** Wire-encode RequestContext the way exec #10 does, for byte-identity asserts. */
 function encodeRequestContext(context: Record<string, unknown>): Uint8Array {
   return buildRequestContextResult(1, context)
+}
+
+type SlimMetaTool = { tool_name: string; description?: unknown; input_schema?: unknown }
+
+function slimMetaDescriptors(context: Record<string, unknown>): Array<{
+  server_identifier: string
+  tools: SlimMetaTool[]
+}> {
+  const meta = context.mcp_meta_tool_options
+  if (!meta || typeof meta !== "object") return []
+  const descriptors = (meta as { mcp_descriptors?: unknown }).mcp_descriptors
+  if (!Array.isArray(descriptors)) return []
+  return descriptors.map((descriptor) => {
+    const record = descriptor && typeof descriptor === "object"
+      ? descriptor as { server_identifier?: unknown; tools?: unknown }
+      : {}
+    return {
+      server_identifier: typeof record.server_identifier === "string" ? record.server_identifier : "",
+      tools: Array.isArray(record.tools)
+        ? record.tools.filter((tool): tool is SlimMetaTool =>
+            !!tool && typeof tool === "object" && typeof (tool as SlimMetaTool).tool_name === "string")
+        : [],
+    }
+  })
+}
+
+function slimMetaTools(context: Record<string, unknown>): SlimMetaTool[] {
+  return slimMetaDescriptors(context).flatMap((descriptor) => descriptor.tools)
 }
 
 describe("frozen request_context", () => {
@@ -108,7 +138,7 @@ describe("frozen request_context", () => {
     expect(second.reused).toBe(true)
     expect(second.context).toBe(first.context)
     expect(Object.isFrozen(first.context)).toBe(true)
-    expect(Object.isFrozen(first.context.tools)).toBe(true)
+    expect(Object.isFrozen(first.context.mcp_meta_tool_options)).toBe(true)
   })
 
   it("deduplicates overlapping builds for one conversation", async () => {
@@ -127,19 +157,20 @@ describe("frozen request_context", () => {
       workspaceRoot: root,
       tools: [{ name: "read" }],
     })
-    const tools = first.context.tools as Array<Record<string, unknown>>
+    const meta = first.context.mcp_meta_tool_options as {
+      mcp_descriptors: Array<{ tools: SlimMetaTool[] }>
+    }
+    const tools = meta.mcp_descriptors[0]!.tools
 
-    expect(() => tools.push({ name: "write" })).toThrow()
-    expect(() => { tools[0]!.name = "write" }).toThrow()
+    expect(() => tools.push({ tool_name: "write" })).toThrow()
+    expect(() => { tools[0]!.tool_name = "write" }).toThrow()
 
     const reused = await getOrBuildRequestContext("conv-freeze-immutable", {
       workspaceRoot: root,
       tools: [{ name: "read" }],
     })
-    expect((reused.context.tools as Array<Record<string, unknown>>)[0]).toMatchObject({
-      name: "opencode-read",
-      tool_name: "read",
-    })
+    expect(slimMetaTools(reused.context)[0]).toEqual({ tool_name: "read" })
+    expect(reused.context.tools).toBeUndefined()
   })
 
   it("keeps encoded request_context bytes identical after workspace changes", async () => {
@@ -172,14 +203,15 @@ describe("frozen request_context", () => {
   it("updates live tools and then reuses byte-identical capabilities", async () => {
     const conversationId = "conv-freeze-tools"
     const empty = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(empty.context.tools).toEqual([])
+    expect(slimMetaTools(empty.context)).toEqual([])
+    expect(empty.context.tools).toBeUndefined()
 
     const upgraded = await getOrBuildRequestContext(conversationId, {
       workspaceRoot: root,
       tools: [{ name: "read" }],
     })
     expect(upgraded.reused).toBe(false)
-    expect(upgraded.context.tools).toHaveLength(1)
+    expect(slimMetaTools(upgraded.context)).toEqual([{ tool_name: "read" }])
 
     const stable = await getOrBuildRequestContext(conversationId, {
       workspaceRoot: root,
@@ -187,7 +219,7 @@ describe("frozen request_context", () => {
     })
     expect(stable.reused).toBe(true)
     expect(stable.context).toBe(upgraded.context)
-    expect(stable.context.tools).toHaveLength(1)
+    expect(slimMetaTools(stable.context)).toEqual([{ tool_name: "read" }])
 
     const changed = await getOrBuildRequestContext(conversationId, {
       workspaceRoot: root,
@@ -200,10 +232,9 @@ describe("frozen request_context", () => {
         },
       }],
     })
-    expect(changed.reused).toBe(false)
-    expect(changed.context).not.toBe(stable.context)
-    expect((changed.context.tools as Array<Record<string, unknown>>)[0]?.tool_name)
-      .toBe("read")
+    expect(changed.reused).toBe(true)
+    expect(changed.context).toBe(stable.context)
+    expect(slimMetaTools(changed.context)).toEqual([{ tool_name: "read" }])
   })
 
   it("reuses the prefix when the host enumerates the same tools in a different order", async () => {
@@ -275,8 +306,8 @@ describe("frozen request_context", () => {
     })
 
     expect(grown.reused).toBe(false)
-    const firstTools = first.context.tools as Array<Record<string, unknown>>
-    const grownTools = grown.context.tools as Array<Record<string, unknown>>
+    const firstTools = slimMetaTools(first.context)
+    const grownTools = slimMetaTools(grown.context)
     expect(grownTools).toHaveLength(2)
     expect(grownTools[0]).toEqual(firstTools[0])
     expect(grownTools[1]?.tool_name).toBe("bash")
@@ -334,15 +365,15 @@ describe("frozen request_context", () => {
 
     expect(empty.reused).toBe(false)
     expect(empty.context).not.toBe(populated.context)
-    expect(empty.context.tools).toEqual([])
+    expect(slimMetaTools(empty.context)).toEqual([])
+    expect(empty.context.tools).toBeUndefined()
   })
 
-  it("discovers skill additions and holds removals during a conversation", async () => {
+  it("omits agent_skills from RequestContext when skills appear on disk", async () => {
     const conversationId = "conv-live-skills"
     const skillDir = path.join(root, ".opencode", "skills", "live-skill")
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect((first.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.full_path === path.join(skillDir, "SKILL.md"))).toBe(false)
+    expect(first.context.agent_skills).toBeUndefined()
 
     await mkdir(skillDir, { recursive: true })
     await writeFile(
@@ -350,60 +381,101 @@ describe("frozen request_context", () => {
       "---\nname: live-skill\ndescription: Added during chat\n---\nUse this live skill.\n",
     )
     const added = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(added.reused).toBe(false)
-    expect((added.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
-    const addedSkills = added.context.agent_skills as Array<Record<string, unknown>>
-    expect(addedSkills[addedSkills.length - 1]?.description).toBe("Added during chat")
-
-    const unchanged = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(unchanged.reused).toBe(true)
-    expect(unchanged.context).toBe(added.context)
-
-    await writeFile(
-      path.join(skillDir, "SKILL.md"),
-      "---\nname: live-skill\ndescription: Edited during chat\n---\nChanged body.\n",
-    )
-    const edited = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(edited.reused).toBe(true)
-    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
-    expect((edited.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Edited during chat")).toBe(false)
+    expect(added.context.agent_skills).toBeUndefined()
+    expect(added.context).toBe(first.context)
 
     await rm(skillDir, { recursive: true, force: true })
-    const removed = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    expect(removed.reused).toBe(true)
-    expect((removed.context.agent_skills as Array<Record<string, unknown>>)
-      .some((skill) => skill.description === "Added during chat")).toBe(true)
   })
 
-  it("appends a skill that sorts earlier instead of inserting it", async () => {
-    const conversationId = "conv-skill-append"
-    const zebraDir = path.join(root, ".opencode", "skills", "zebra-skill")
-    const alphaDir = path.join(root, ".opencode", "skills", "alpha-skill")
-    await mkdir(zebraDir, { recursive: true })
-    await writeFile(
-      path.join(zebraDir, "SKILL.md"),
-      "---\nname: zebra-skill\ndescription: Zebra\n---\nZ.\n",
-    )
-    const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    const firstSkills = first.context.agent_skills as Array<Record<string, unknown>>
-    const zebraIndex = firstSkills.findIndex((skill) => skill.description === "Zebra")
-    expect(zebraIndex).toBeGreaterThanOrEqual(0)
+  describe("system-instructions rule", () => {
+    const rule = (text: string) => ({
+      full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
+      content: text,
+      type: { global: {} },
+    })
 
-    await mkdir(alphaDir, { recursive: true })
-    await writeFile(
-      path.join(alphaDir, "SKILL.md"),
-      "---\nname: alpha-skill\ndescription: Alpha\n---\nA.\n",
-    )
-    const grown = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
-    const grownSkills = grown.context.agent_skills as Array<Record<string, unknown>>
-    expect(grown.reused).toBe(false)
-    expect(grownSkills.slice(0, firstSkills.length)).toEqual(firstSkills)
-    expect(grownSkills[grownSkills.length - 1]?.description).toBe("Alpha")
-    await rm(alphaDir, { recursive: true, force: true })
-    await rm(zebraDir, { recursive: true, force: true })
+    it("freezes the host system context as one global rule on every Run", async () => {
+      const conversationId = "conv-system-rule"
+      const systemInstructions = { text: "Host prompt\n\nGuidance", authoritative: true }
+      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(first.context.rules).toEqual([rule("Host prompt\n\nGuidance")])
+      // Checkpoint Run: same epoch baseline, same bytes, reused object.
+      const again = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(again.reused).toBe(true)
+      expect(again.context).toBe(first.context)
+      // Wire encoding keeps the rule type (an untyped rule is never applied).
+      const wire = decodeMessage<any>("AgentClientMessage", encodeRequestContext(again.context))
+      expect(wire.exec_client_message.request_context_result.success.request_context.rules)
+        .toEqual([rule("Host prompt\n\nGuidance")])
+    })
+
+    it("replaces the rule for a new epoch baseline but not for a recovered epoch", async () => {
+      const conversationId = "conv-system-rule-epoch"
+      await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "baseline A", authoritative: true },
+      })
+      const recovered = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "live text", authoritative: false },
+      })
+      expect(recovered.context.rules).toEqual([rule("baseline A")])
+      const reseeded = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "baseline B", authoritative: true },
+      })
+      expect(reseeded.context.rules).toEqual([rule("baseline B")])
+    })
+
+    it("fills a persisted base that has no rule and drops legacy untyped rules", async () => {
+      const conversationId = "conv-system-rule-legacy"
+      setFrozenRequestContext(conversationId, {
+        rules: [{ full_path: "/tmp/AGENTS.md", content: "# untyped, never applied" }],
+        env: { workspace_paths: [root] },
+      })
+      const filled = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "live text", authoritative: false },
+      })
+      expect(filled.context.rules).toEqual([rule("live text")])
+    })
+
+    it("survives a durable restart byte-identically", async () => {
+      const sessionKey = "ses-system-rule-restart"
+      const conversationId = bindConversationId(sessionKey).conversationId
+      const first = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "frozen baseline", authoritative: true },
+      })
+      await persistConversationState(cacheRoot, { sessionKey, conversationId, requestContext: first.context })
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      resetFrozenRequestContextsForTests()
+
+      await hydrateConversationState(cacheRoot, sessionKey)
+      // After restart the epoch is recovered (no baseline bytes): live text must not win.
+      const rebuilt = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "changed live text", authoritative: false },
+      })
+      expect(rebuilt.context.rules).toEqual([rule("frozen baseline")])
+      expect(sha(encodeRequestContext(rebuilt.context))).toBe(sha(encodeRequestContext(first.context)))
+    })
+  })
+
+  it("strips rules from a hydrated frozen base", async () => {
+    const conversationId = "conv-strip-rules"
+    setFrozenRequestContext(conversationId, {
+      rules: [{ full_path: "/tmp/AGENTS.md", content: "# leftover" }],
+      agent_skills: [{ full_path: "/tmp/SKILL.md", content: "nope" }],
+      env: { workspace_paths: [root] },
+    })
+    const frozen = getFrozenRequestContext(conversationId)
+    expect(frozen?.rules).toBeUndefined()
+    expect(frozen?.agent_skills).toBeUndefined()
+    const rebuilt = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+    expect(rebuilt.context.rules).toBeUndefined()
+    expect(rebuilt.context.agent_skills).toBeUndefined()
   })
 
   it("holds custom subagents when the host omits the executor", async () => {
@@ -416,21 +488,21 @@ describe("frozen request_context", () => {
         properties: {
           description: { type: "string" },
           prompt: { type: "string" },
-          subagent_type: { type: "string" },
+          subagent_type: { type: "string", enum: ["general", "explore"] },
         },
       },
     }]
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
     const firstAgents = (first.context.custom_subagents as Array<Record<string, unknown>>)
       .map((agent) => agent.name)
-    expect(firstAgents).toContain("general")
-    expect(firstAgents).toContain("explore")
+    expect(firstAgents).toEqual(["explore", "general"])
 
     const empty = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
     expect(empty.reused).toBe(false)
     expect((empty.context.custom_subagents as Array<Record<string, unknown>>)
       .map((agent) => agent.name)).toEqual(firstAgents)
-    expect(empty.context.tools).toEqual([])
+    expect(empty.context.tools).toBeUndefined()
+    expect(slimMetaTools(empty.context)).toEqual([])
   })
 
   it("appends a plugin line at the tail instead of re-sorting", async () => {
@@ -455,13 +527,13 @@ describe("frozen request_context", () => {
     const configPath = path.join(root, "opencode.json")
     const tools = [{ name: "github_create_issue", description: "Create issue" }]
     const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
-    expect((first.context.tools as Array<Record<string, unknown>>)[0]?.provider_identifier)
+    expect(slimMetaDescriptors(first.context)[0]?.server_identifier)
       .toBe("opencode")
 
     await writeFile(configPath, JSON.stringify({ mcp: { github: { type: "remote" } } }))
     const enabled = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
     expect(enabled.reused).toBe(false)
-    expect((enabled.context.tools as Array<Record<string, unknown>>)[0]?.provider_identifier)
+    expect(slimMetaDescriptors(enabled.context)[0]?.server_identifier)
       .toBe("github")
 
     const unchanged = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
@@ -471,7 +543,7 @@ describe("frozen request_context", () => {
     await rm(configPath, { force: true })
     const disabled = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, tools })
     expect(disabled.reused).toBe(false)
-    expect((disabled.context.tools as Array<Record<string, unknown>>)[0]?.provider_identifier)
+    expect(slimMetaDescriptors(disabled.context)[0]?.server_identifier)
       .toBe("opencode")
   })
 
@@ -510,7 +582,7 @@ describe("frozen request_context", () => {
       tools: [...tools, { name: "write" }],
     })
     expect(changed.reused).toBe(false)
-    expect(changed.context.tools).toHaveLength(2)
+    expect(slimMetaTools(changed.context)).toHaveLength(2)
   })
 
   it("binding LRU eviction keeps the frozen context warm", () => {

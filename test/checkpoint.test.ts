@@ -53,7 +53,6 @@ describe("buildRunRequest checkpoint echo", () => {
       text: "follow up",
       modelId: "m",
       conversationId: "c",
-      systemPrompt: "Should not appear in state when checkpoint is set",
       conversationState: checkpoint,
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
@@ -64,22 +63,24 @@ describe("buildRunRequest checkpoint echo", () => {
     )
   })
 
-  it("seeds system prompt when no checkpoint is provided", () => {
+  it("seeds history without a system entry when no checkpoint is provided", () => {
     const data = buildRunRequest({
       text: "hi",
       modelId: "m",
       conversationId: "c",
-      systemPrompt: "Be brief.",
+      history: [
+        { role: "system", content: "Be brief." },
+        { role: "user", content: "earlier" },
+      ],
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
     const cs = decodeMessage<any>(
       "ConversationStateStructure",
       decoded.run_request.conversation_state,
     )
-    expect(JSON.parse(cs.root_prompt_messages_json[0])).toEqual({
-      role: "system",
-      content: "Be brief.",
-    })
+    expect(cs.root_prompt_messages_json.map((s: string) => JSON.parse(s))).toEqual([
+      { role: "user", content: "earlier" },
+    ])
   })
 
   it("encodes checkpoint recovery as ResumeAction without replaying user text", () => {

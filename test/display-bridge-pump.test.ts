@@ -165,6 +165,8 @@ function fakeSession(
     displayToolCalls: new Map(),
     nextBridgedExecId: 900_000,
     blobs: new Map(),
+    toolCatalog: definitions,
+    knownMcpServers: ["github"],
     toolDescriptors: tools,
     requestContext: {
       tools,

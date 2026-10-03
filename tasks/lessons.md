@@ -499,3 +499,10 @@
   harvests tool-result and earlier-user images on the next fresh Run. Grep the
   feature (images, media) across `src/` and read the code comments that state
   intent before reporting a regression.
+
+## 2026-10-03 — Review restart recovery against effective context
+
+- Test an instruction change during downtime and a return to the original
+  instructions after an intervening update. Matching the frozen first-turn
+  prefix does not prove matching the checkpoint's latest effective context
+  (`test/context-epoch.test.ts:158`).

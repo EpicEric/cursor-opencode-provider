@@ -33,6 +33,7 @@ import {
   buildReadMcpResourceFallback,
   buildCustomWebToolAliases,
   extractHostSubagentCatalog,
+  toolsToDescriptors,
   resolveCustomWebToolAlias,
   remapNativeSubagentForCatalog,
   preferCorrelatedTaskDescription,
@@ -172,12 +173,11 @@ import {
   toCursorProviderError,
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
-import { getOrBuildRequestContext } from "./context/frozen.js"
-import { getHeldOverlaySkills } from "./context/overlay.js"
+import { getFrozenRequestContext, getOrBuildRequestContext } from "./context/frozen.js"
+import { systemInstructionsRuleText, type SystemInstructions } from "./context/build.js"
 import { loadMergedConfig } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
-  takeSkillCatalogChangeReminder,
 } from "./context/dynamic-catalog.js"
 import {
   admitContextEpoch,
@@ -805,6 +805,7 @@ async function doStreamImpl(
     // session and returns undefined so we fall through to history rebase
     // instead of pumping a connection that can no longer accept writes.
     session = deliverContinuationResults(session, trailingToolResults)
+    if (session) await refreshHeldSessionToolCatalog(session, callOptions)
   }
 
   if (!session) {
@@ -1199,10 +1200,11 @@ async function startSession(
     workspaceRoot: options.workspaceRoot,
   })
   const baseSystemPrompt = extractSystemPrompt(prompt)
-  // One merged-config load per Run: guidance MCP ids and RequestContext
-  // descriptors must agree, and warm turns must not pay for a second disk read.
-  const mergedConfig = isCompaction ? undefined : await loadMergedConfig(workspaceRoot)
-  const knownMcpServers = Object.keys(mergedConfig?.mcp ?? {})
+  // One merged-config load per Run: RequestContext names, session descriptors
+  // (exec remap, exec #36) and guidance MCP ids must agree on server identity,
+  // and warm turns must not pay for a second disk read.
+  const mergedConfig = await loadMergedConfig(workspaceRoot)
+  const knownMcpServers = Object.keys(mergedConfig.mcp ?? {})
   const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot, {
     knownMcpServers,
   })
@@ -1306,7 +1308,12 @@ async function startSession(
     kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
   ].filter((part): part is string => !!part)
 
+  // `systemPrompt` is the host system context composed for a seed Run (kept for
+  // diagnostics and size estimates). It reaches Cursor only as the frozen
+  // system-instructions rule in RequestContext, never as a seeded `system`
+  // message, which Cursor does not follow.
   let systemPrompt: string | undefined
+  let systemInstructions: SystemInstructions | undefined
   if (isCompaction || lifecycle) {
     // Ephemeral summary/title Runs — do not initialize a sticky Context Epoch.
     systemPrompt = startedWithCheckpoint
@@ -1315,6 +1322,9 @@ async function startSession(
     if (startedWithCheckpoint && oneShotReminders.length) {
       userText = appendMidConversationMessage(userText, oneShotReminders.join("\n\n"))
     }
+    const ephemeralText = systemPrompt
+      ?? [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
+    if (ephemeralText) systemInstructions = { text: ephemeralText, authoritative: true }
   } else {
     const admitted = admitContextEpoch({
       conversationId,
@@ -1324,9 +1334,19 @@ async function startSession(
       hostAgent,
       workspaceRoot,
       oneShotReminders,
+      recoveredBaseline: systemInstructionsRuleText(getFrozenRequestContext(conversationId) ?? {}),
     })
     systemPrompt = startedWithCheckpoint ? undefined : admitted.seedSystemPrompt
     userText = appendMidConversationMessage(userText, admitted.midConversationMessage)
+    // The epoch baseline is the rule for every Run of this conversation. A
+    // recovered epoch keeps the persisted rule, and uses live context only if
+    // a legacy checkpoint was persisted without baseline bytes.
+    const frozenBaseline = admitted.epoch.baselineSystemPrompt
+    const instructionText = frozenBaseline
+      || [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
+    if (instructionText) {
+      systemInstructions = { text: instructionText, authoritative: !!frozenBaseline }
+    }
     // A recovered epoch has no baseline bytes. Keep the hash restored from
     // the checkpoint snapshot so this turn's TurnEnded save does not drop it.
     const previousIdentity = sessionKey ? promptIdentityBySession.get(sessionKey) : undefined
@@ -1437,21 +1457,11 @@ async function startSession(
   // Run mutates volatile slices (git porcelain, layout) and breaks prompt cache.
   const { context: requestContext, reused: requestContextReused } = await getOrBuildRequestContext(
     conversationId,
-    { workspaceRoot, tools: cursorTools, mergedConfig },
+    { workspaceRoot, tools: cursorTools, mergedConfig, systemInstructions },
   )
-  // Issue #29: after skills are in RequestContext, admit the catalog. OpenCode
-  // only Mid-Conversation-updates when the available-skills list changes
-  // (SkillGuidance / SkillInstructions) — never per-turn matched-id nudges.
-  // Gate on the host-permitted set, not the epoch-held advertisement.
-  if (!isCompaction && !lifecycle) {
-    const skillDialect = hostToolDialectFromTools(tools, options.defaultDialect)
-    const skillNudge = takeSkillCatalogChangeReminder(conversationId, {
-      hasSkillTool: allowTools && incomingTools.some((tool) => tool.name === "skill"),
-      skills: getHeldOverlaySkills(conversationId),
-      skillArgKey: skillDialect.skillArgKey,
-    })
-    userText = appendMidConversationMessage(userText, skillNudge)
-  }
+  // Skills live in the host system prompt and `skill` tool. Do not scan disk or
+  // emit RequestContext `agent_skills` Mid-Conversation XML; host `<system-update>`
+  // is the catalog-change channel.
   const contextSubagents = Array.isArray(requestContext.custom_subagents)
     ? requestContext.custom_subagents
         .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"
@@ -1471,11 +1481,9 @@ async function startSession(
         .map((agent) => [agent.name, agent]),
     ).values()],
   }
-  // Resolve descriptors once from the merged OpenCode config so MCP identity is
-  // consistent across AgentRunRequest and both request_context reply paths.
-  const toolDescriptors = Array.isArray(requestContext.tools)
-    ? requestContext.tools as Array<Record<string, unknown>>
-    : []
+  // Session exec remap / bridges need full McpToolDefinition identity. The wire
+  // omits RequestContext.tools (#7); do not read descriptors from there.
+  const toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
   // CLI parity: echo the last conversation_checkpoint_update as conversation_state.
   // After compaction or an unsafe checkpoint reset there is no checkpoint —
   // seed a new Cursor conversation from OpenCode's authoritative history.
@@ -1485,7 +1493,6 @@ async function startSession(
     modelId: cursorModelId,
     conversationId,
     conversationGroupId,
-    systemPrompt: conversationState ? undefined : systemPrompt,
     history: conversationState ? undefined : history,
     conversationState,
     parameterValues,
@@ -1498,9 +1505,6 @@ async function startSession(
   // Content hashes — Cursor content-addresses large payloads; logging these lets
   // us match a server get_blob_args.blob_id to what it wants served.
   const sha = (b: string | Uint8Array) => createHash("sha256").update(b).digest("hex")
-  const skillsCount = Array.isArray(requestContext.agent_skills)
-    ? requestContext.agent_skills.length
-    : 0
   const hooksCtx =
     typeof requestContext.hooks_additional_context === "string"
       ? requestContext.hooks_additional_context
@@ -1535,7 +1539,7 @@ async function startSession(
       `params=${JSON.stringify(parameterValues ?? [])} ` +
       `maxMode=${maxMode} systemPromptLen=${systemPrompt?.length ?? 0} ` +
       `tools=${tools.length} incomingTools=${incomingTools.length} compaction=${isCompaction} ` +
-      `skills=${skillsCount} hooks=${hooksCtx ? hooksCtx.split("\n").length : 0} ` +
+      `hooks=${hooksCtx ? hooksCtx.split("\n").length : 0} ` +
       `availableModels=${_availableModels?.length ?? 0} userTextLen=${userText.length} ` +
       `images=${images.length} imageBytes=${images.reduce((total, image) => total + image.data.length, 0)} ` +
       `historyMsgs=${history.length} historyChars=${historyChars} ` +
@@ -1600,7 +1604,8 @@ async function startSession(
     hostAgent,
     stableSystemPromptHash: frozenSystemPromptHash,
     postCompactionRebase: isCompaction,
-    toolCatalog: snapshotToolCatalog(sessionKey),
+    toolCatalog: sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(tools),
+    knownMcpServers,
     stream,
     frames: stream.frames()[Symbol.asyncIterator](),
     pending: new Map(),
@@ -3432,15 +3437,14 @@ export async function pump(
       cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
       if (esm.request_context_args) {
-        // Server turn-setup probe (#10). Reply with full OpenCode-sourced context.
+        // Server turn-setup probe (#10). Reply with the same RequestContext the Run sent.
         {
           const rc = session.requestContext
-          const skills = Array.isArray(rc.agent_skills) ? rc.agent_skills.length : 0
           const hooks =
             typeof rc.hooks_additional_context === "string" ? rc.hooks_additional_context : ""
           trace(
             `exec request_context: id=${esmId} — replying context ` +
-              `tools=${session.toolDescriptors.length} skills=${skills} ` +
+              `tools=${session.toolDescriptors.length} ` +
               `hooks=${hooks ? hooks.split("\n").length : 0}`,
           )
           if (hooks) trace(`exec request_context hooks_additional_context: ${hooks}`)
@@ -3462,8 +3466,9 @@ export async function pump(
         }
       } else if (esm.mcp_state_exec_args) {
         // MCP-backed writes/reads can be preceded by this control-plane probe.
-        // Confirm the virtual servers from the already-advertised context, then
-        // keep pumping until Cursor emits the actual mcp_args tool request.
+        // Confirm servers from the live host catalog (refreshed on each
+        // doStream, including continuation), then keep pumping until Cursor
+        // emits the actual mcp_args tool request.
         const stateArgs = esm.mcp_state_exec_args as Record<string, unknown>
         const requested = Array.isArray(stateArgs.server_identifiers)
           ? stateArgs.server_identifiers.join(",")
@@ -3471,7 +3476,7 @@ export async function pump(
         try {
           await writeWithBackpressure(
             session.stream,
-            buildMcpStateResult(esmId, stateArgs, session.requestContext),
+            buildMcpStateResult(esmId, stateArgs, session.toolDescriptors),
             `MCP-state reply id=${esmId}`,
           )
           trace(`exec mcp_state: replied id=${esmId} requested=[${requested}]`)
@@ -4243,9 +4248,8 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
 }
 
 /**
- * Checkpointed Runs do not resend the system prompt. Keep the workspace root
- * on the live user message, and require absolute `path` arguments when that is
- * the host's file-tool dialect.
+ * Keep the workspace root on a checkpointed turn's live user message too, and
+ * require absolute `path` arguments when that is the host's file-tool dialect.
  */
 export function groundCheckpointTurnText(
   userText: string,
@@ -4630,6 +4634,73 @@ export function resolveConversationId(callOptions: LanguageModelV3CallOptions): 
 }
 
 export { sessionIdToUuid } from "./protocol/conversation-bind.js"
+
+/**
+ * Grow the held Run's advertised + permitted catalog from this `doStream`
+ * call. Continuation skips `startSession`, so without this, exec #36 and
+ * permission keep the freeze from Run open. MCP server ids stay those of the
+ * Run's one merged-config load (`startSession`); a tool that connects later
+ * still gets its identity from that set.
+ */
+export async function refreshHeldSessionToolCatalog(
+  session: CursorSession,
+  callOptions: LanguageModelV3CallOptions,
+): Promise<void> {
+  const sessionKey = session.openCodeSessionId
+  const incomingTools = extractTools(callOptions)
+  const providerOptions = callOptions.providerOptions?.cursor as Record<string, unknown> | undefined
+  const compactionOption = providerOptions?.[CURSOR_COMPACTION_OPTION]
+  const isCompaction = compactionOption === true || (
+    compactionOption === undefined && !!sessionKey && isCompactionSession(sessionKey)
+  )
+  const toolState = await resolveTurnToolState({
+    sessionKey,
+    incomingTools,
+    toolChoice: callOptions.toolChoice,
+    isCompaction,
+    abortSignal: callOptions.abortSignal,
+  })
+  // A standalone caller has no host session key for the process catalog cache.
+  // Its held Run still owns an epoch: keep its prefix and append new names.
+  const cachedTools = !sessionKey ? session.toolCatalog ?? [] : []
+  const cachedNames = new Set(cachedTools.map(tool => tool.name))
+  const advertisedTools = cachedTools.length > 0
+    ? [...cachedTools, ...toolState.advertisedTools.filter(tool => !cachedNames.has(tool.name))]
+    : toolState.advertisedTools
+  const webToolAliases = buildCustomWebToolAliases(advertisedTools)
+  const cursorTools = webToolAliases.advertisedTools
+  const knownMcpServers = session.knownMcpServers ?? []
+  const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
+  const contextSubagents = Array.isArray(session.requestContext.custom_subagents)
+    ? session.requestContext.custom_subagents
+        .map((agent) => agent && typeof agent === "object" && typeof (agent as Record<string, unknown>).name === "string"
+          ? {
+              name: (agent as Record<string, unknown>).name as string,
+              description: typeof (agent as Record<string, unknown>).description === "string"
+                ? (agent as Record<string, unknown>).description as string
+                : undefined,
+            }
+          : undefined)
+        .filter((agent): agent is { name: string; description: string | undefined } => !!agent)
+    : []
+  session.toolCatalog = sessionKey ? snapshotToolCatalog(sessionKey) : structuredClone(advertisedTools)
+  session.toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
+  session.toolAliases = webToolAliases.aliases
+  session.hostToolDialect = hostToolDialectFromTools(advertisedTools, session.hostToolDialect)
+  session.subagentCatalog = {
+    ...discoveredSubagentCatalog,
+    agents: [...new Map(
+      [...discoveredSubagentCatalog.agents, ...contextSubagents]
+        .map((agent) => [agent.name, agent]),
+    ).values()],
+  }
+  session.allowTools = toolState.allowTools
+  session.permittedToolNames = new Set(
+    toolState.allowTools
+      ? incomingTools.map((tool) => tool.name).filter((name): name is string => !!name)
+      : [],
+  )
+}
 
 function extractTools(callOptions: LanguageModelV3CallOptions): OpencodeToolDef[] {
   const tools = callOptions.tools

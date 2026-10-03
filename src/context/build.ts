@@ -1,19 +1,14 @@
 import path from "node:path"
 import {
   extractHostSubagentCatalog,
-  toolsToDescriptors,
   toolsToMcpDescriptors,
   type HostSubagentDefinition,
   type OpencodeToolDef,
 } from "../protocol/tools.js"
 import {
-  collectRules,
-  findGitWorktree,
   loadMergedConfig,
   type OpencodeJson,
 } from "./rules.js"
-import { collectSkills } from "./skills.js"
-import { collectAgents } from "./agents.js"
 import { collectPlugins } from "./plugins.js"
 import { collectGit } from "./git.js"
 import { collectProjectLayout } from "./layout.js"
@@ -33,17 +28,88 @@ export type BuildRequestContextInput = {
    * guidance MCP server ids). Skips a second `loadMergedConfig` disk read.
    */
   mergedConfig?: OpencodeJson
+  /** Host system context to deliver as the frozen system-instructions rule. */
+  systemInstructions?: SystemInstructions
+}
+
+/**
+ * Host system context (OpenCode's system prompt plus this provider's
+ * interaction guidance) for one Cursor conversation.
+ */
+export type SystemInstructions = {
+  text: string
+  /**
+   * True when `text` is this conversation's own frozen baseline (a Context
+   * Epoch started in this process, or an ephemeral Run's prompt): it replaces
+   * any rule already frozen. False when a restart recovered the epoch without
+   * its bytes: the persisted rule wins and `text` only fills a missing one.
+   */
+  authoritative: boolean
+}
+
+/** Rule name Cursor shows for the host system context (not a file). */
+export const SYSTEM_INSTRUCTIONS_RULE_PATH = "OpenCode system instructions"
+
+/**
+ * Cursor does not follow a client-seeded `system` message, and applies a rule
+ * only by its type. The Cursor CLI sends AGENTS.md as `alwaysApply`
+ * (`CursorRuleType.global`) and the IDE ships its own guidance as a non-file
+ * global rule; the host system context goes out the same way, once, frozen
+ * with the RequestContext base.
+ */
+export function systemInstructionsRule(text: string): Record<string, unknown> {
+  return {
+    full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
+    content: text,
+    type: { global: {} },
+  }
+}
+
+function isSystemInstructionsRule(rule: unknown): rule is Record<string, unknown> {
+  if (!rule || typeof rule !== "object") return false
+  const record = rule as Record<string, unknown>
+  const type = record.type as Record<string, unknown> | undefined
+  return record.full_path === SYSTEM_INSTRUCTIONS_RULE_PATH && !!type?.global
+    && typeof record.content === "string"
+}
+
+/** Text of the frozen system-instructions rule, if the context carries one. */
+export function systemInstructionsRuleText(context: Record<string, unknown>): string | undefined {
+  const rules = Array.isArray(context.rules) ? context.rules : []
+  const rule = rules.find(isSystemInstructionsRule)
+  return rule ? rule.content as string : undefined
+}
+
+/**
+ * Return `context` with the system-instructions rule applied, or the same
+ * object when nothing changes (see `SystemInstructions.authoritative`).
+ */
+export function withSystemInstructions(
+  context: Record<string, unknown>,
+  instructions: SystemInstructions | undefined,
+): Record<string, unknown> {
+  const text = instructions?.text.trim() ? instructions.text : undefined
+  if (!text) return context
+  const current = systemInstructionsRuleText(context)
+  if (current !== undefined && (current === text || !instructions!.authoritative)) return context
+  return { ...context, rules: [systemInstructionsRule(text)] }
+}
+
+/** Keep only the system-instructions rule; older bases carried untyped rules Cursor never applied. */
+function keepSystemInstructionsRule(context: Record<string, unknown>): void {
+  if (!Object.hasOwn(context, "rules")) return
+  const rules = Array.isArray(context.rules) ? context.rules.filter(isSystemInstructionsRule) : []
+  if (rules.length > 0) context.rules = rules.slice(0, 1)
+  else delete context.rules
 }
 
 export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
   "tools",
-  "agent_skills",
   "custom_subagents",
   "mcp_file_system_options",
   "mcp_meta_tool_options",
   "web_search_enabled",
   "web_fetch_enabled",
-  "agent_skills_info_complete",
   "custom_subagents_info_complete",
   "mcp_file_system_info_complete",
   "mcp_info_complete",
@@ -52,16 +118,14 @@ export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
 
 export type DynamicRequestContextKey = typeof DYNAMIC_REQUEST_CONTEXT_KEYS[number]
 
-const DEFAULT_HOST_SUBAGENTS: HostSubagentDefinition[] = [
-  {
-    name: "general",
-    description: "General-purpose agent for complex research and multi-step tasks.",
-  },
-  {
-    name: "explore",
-    description: "Read-only agent for searching and understanding the local codebase.",
-  },
-]
+/**
+ * The host system context (delivered as the system-instructions rule) already
+ * carries these; never keep them on a frozen base.
+ */
+export const HOST_DUPLICATED_REQUEST_CONTEXT_KEYS = [
+  "agent_skills",
+  "agent_skills_info_complete",
+] as const
 
 type AdvertisedSubagentCatalog = {
   agents: HostSubagentDefinition[]
@@ -69,55 +133,39 @@ type AdvertisedSubagentCatalog = {
 }
 
 /**
- * Convert the raw host executor catalog into the exact subagent list advertised
- * to Cursor. `hostSubagents.complete` answers a narrow question: did the host's
- * task tool itself exposes an exhaustive recipient list (schema enum or
- * catalog marker)? OpenCode's task tool intentionally uses a plain string, so
- * that raw flag is false even though we can still advertise a complete Cursor
- * catalog by adding built-in defaults and discovered agent files.
- *
- * `custom_subagents_info_complete` must describe the final advertised list, not
- * the raw extraction source. If there is no executor, the empty list is
- * complete. If the host catalog is complete, use it verbatim. Otherwise we make
- * the advertised set complete by augmenting with default host agents and all
- * locally discovered agents.
+ * Advertise only what the host `task` / `subagent` catalog already named.
  */
 function buildAdvertisedSubagentCatalog(
   hostSubagents: ReturnType<typeof extractHostSubagentCatalog>,
-  discoveredAgents: HostSubagentDefinition[],
 ): AdvertisedSubagentCatalog {
   if (!hostSubagents.executor) return { agents: [], complete: true }
-  if (hostSubagents.complete) return { agents: hostSubagents.agents, complete: true }
-  return {
-    agents: [...DEFAULT_HOST_SUBAGENTS, ...hostSubagents.agents, ...discoveredAgents],
-    complete: true,
-  }
+  return { agents: hostSubagents.agents, complete: hostSubagents.complete }
+}
+
+function stripHostDuplicatedRequestContextFields(context: Record<string, unknown>): void {
+  for (const key of HOST_DUPLICATED_REQUEST_CONTEXT_KEYS) delete context[key]
+  keepSystemInstructionsRule(context)
 }
 
 /**
  * Full RequestContext payload for live UMA + exec #10 reply.
- * Sourced from OpenCode discovery (and .claude/.agents skill fallbacks).
- * Honors `instructions` globs the same way OpenCode does. The provider never
- * looks in Cursor's own directories; a `.cursor/` path is read only when the
- * user's own OpenCode config lists it, exactly as the host would read it.
+ * Workspace env/git/layout, the host system-instructions rule, and
+ * host-advertised tools and subagents. The provider never looks in Cursor's
+ * own directories.
  */
 export async function buildRequestContext(
   input: BuildRequestContextInput,
 ): Promise<Record<string, unknown>> {
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
-  const { rules, config, worktree } = await collectRules(workspaceRoot, input.mergedConfig)
+  const config = input.mergedConfig ?? await loadMergedConfig(workspaceRoot)
   const [dynamic, git, layout] = await Promise.all([
-    buildDynamicRequestContextFromDiscovery(input, workspaceRoot, worktree, config),
+    buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config),
     collectGit(workspaceRoot),
     collectProjectLayout(workspaceRoot),
   ])
 
-  const base: Record<string, unknown> = {
+  const workspace: Record<string, unknown> = {
     env: buildEnv(workspaceRoot),
-    rules: rules.map((r) => ({
-      full_path: r.fullPath,
-      content: r.content,
-    })),
     repository_info: git.repositoryInfo,
     git_repos: git.gitRepos,
     project_layouts: [layout],
@@ -127,6 +175,7 @@ export async function buildRequestContext(
     git_repo_info_complete: true,
     git_status_info_complete: true,
   }
+  const base = withSystemInstructions(workspace, input.systemInstructions)
   const ctx = materializeRequestContext(base, dynamic)
 
   traceRequestContextPaths("buildRequestContext", ctx)
@@ -136,45 +185,22 @@ export async function buildRequestContext(
 async function buildDynamicRequestContextFromDiscovery(
   input: BuildRequestContextInput,
   workspaceRoot: string,
-  worktree: string,
   config: OpencodeJson,
 ): Promise<Record<string, unknown>> {
   const providerIdentifier = input.providerIdentifier ?? "opencode"
   const tools = input.tools ?? []
-  const [skills, agents, plugins] = await Promise.all([
-    collectSkills(workspaceRoot, worktree),
-    collectAgents(workspaceRoot),
-    collectPlugins(workspaceRoot, config),
-  ])
+  const plugins = await collectPlugins(workspaceRoot, config)
 
   const mcpServerNames = Object.keys(config.mcp ?? {})
-  const flat = toolsToDescriptors(tools, providerIdentifier, mcpServerNames)
-  const nested = toolsToMcpDescriptors(tools, providerIdentifier, mcpServerNames)
+  const slim = toolsToMcpDescriptors(tools, providerIdentifier, mcpServerNames, { namesOnly: true })
   const projectDir = ensureOpencodeProjectDir(workspaceRoot)
   const hostSubagents = extractHostSubagentCatalog(tools)
-  const advertisedSubagents = buildAdvertisedSubagentCatalog(hostSubagents, agents)
-  const discoveredByName = new Map(agents.map((agent) => [agent.name, agent]))
-  const advertisedByName = new Map<string, HostSubagentDefinition>()
-  for (const agent of advertisedSubagents.agents) {
-    if (!advertisedByName.has(agent.name)) advertisedByName.set(agent.name, agent)
-  }
-  const customSubagents = [...advertisedByName.values()].map((agent) => {
-    const discovered = discoveredByName.get(agent.name)
-    return {
-      full_path: discovered?.fullPath ?? "",
-      name: agent.name,
-      description: discovered?.description || agent.description || "Host-configured subagent.",
-      // The host applies the real configured prompt when Task/Actor executes.
-      // Cursor only needs enough context to select the recipient intentionally.
-      prompt: discovered?.prompt ||
-        `Delegate to the host-configured ${agent.name} subagent; its host instructions and tools apply.`,
-    }
-  })
-  const liveSkills = skills.map((s) => ({
-    id: s.name,
-    full_path: s.fullPath,
-    content: s.content,
-    description: s.description,
+  const advertisedSubagents = buildAdvertisedSubagentCatalog(hostSubagents)
+  const customSubagents = advertisedSubagents.agents.map((agent) => ({
+    full_path: "",
+    name: agent.name,
+    description: agent.description || "Host-configured subagent.",
+    prompt: `Delegate to the host-configured ${agent.name} subagent; its host instructions and tools apply.`,
   }))
   const livePlugins = plugins.map((p) => ({
     id: p.id,
@@ -182,25 +208,20 @@ async function buildDynamicRequestContextFromDiscovery(
   }))
   const overlay = input.conversationId
     ? holdCapabilityOverlay(input.conversationId, {
-        skills: liveSkills,
         subagents: customSubagents,
         plugins: livePlugins,
       })
-    : { skills: liveSkills.map(({ full_path, content, description }) => ({ full_path, content, description })), subagents: customSubagents, plugins: livePlugins }
+    : { subagents: customSubagents, plugins: livePlugins }
 
   const dynamic: Record<string, unknown> = {
-    tools: flat,
-    agent_skills: overlay.skills,
-    custom_subagents: overlay.subagents,
     mcp_file_system_options: {
       enabled: true,
       // Cursor metadata root (mcps / agent-tools), not the git workspace.
       workspace_project_dir: projectDir,
-      mcp_descriptors: nested,
     },
     mcp_meta_tool_options: {
       enabled: true,
-      mcp_descriptors: nested,
+      ...(slim.length > 0 ? { mcp_descriptors: slim } : {}),
     },
     // This provider always rejects native web_search/web_fetch interaction
     // queries with a headless-UI reason (see interactions.ts). Advertise that
@@ -208,11 +229,11 @@ async function buildDynamicRequestContextFromDiscovery(
     // custom_web* aliases instead of routing through a query doomed to fail.
     web_search_enabled: false,
     web_fetch_enabled: false,
-    agent_skills_info_complete: true,
     custom_subagents_info_complete: advertisedSubagents.complete,
     mcp_file_system_info_complete: true,
     mcp_info_complete: true,
   }
+  if (overlay.subagents.length > 0) dynamic.custom_subagents = overlay.subagents
 
   if (overlay.plugins.length > 0) {
     dynamic.hooks_additional_context = overlay.plugins.map((p) => p.line).join("\n")
@@ -226,13 +247,10 @@ export async function buildDynamicRequestContext(
   input: BuildRequestContextInput,
 ): Promise<Record<string, unknown>> {
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
-  const [worktree, config] = await Promise.all([
-    findGitWorktree(workspaceRoot),
-    input.mergedConfig
-      ? Promise.resolve(input.mergedConfig)
-      : loadMergedConfig(workspaceRoot),
-  ])
-  return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, worktree, config)
+  const config = input.mergedConfig
+    ? input.mergedConfig
+    : await loadMergedConfig(workspaceRoot)
+  return buildDynamicRequestContextFromDiscovery(input, workspaceRoot, config)
 }
 
 /** Keep expensive workspace state frozen while replacing every live capability field. */
@@ -241,6 +259,7 @@ export function materializeRequestContext(
   dynamic: Record<string, unknown>,
 ): Record<string, unknown> {
   const context = structuredClone(base)
+  stripHostDuplicatedRequestContextFields(context)
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) delete context[key]
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) {
     if (Object.hasOwn(dynamic, key)) context[key] = structuredClone(dynamic[key])
@@ -253,6 +272,7 @@ export function requestContextBase(
   context: Record<string, unknown>,
 ): Record<string, unknown> {
   const base = structuredClone(context)
+  stripHostDuplicatedRequestContextFields(base)
   for (const key of DYNAMIC_REQUEST_CONTEXT_KEYS) delete base[key]
   return base
 }

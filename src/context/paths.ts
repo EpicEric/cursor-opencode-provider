@@ -155,7 +155,7 @@ export function hostPlansDir(_workspaceRoot?: string): string {
 }
 
 /**
- * Cursor-compatible path slug (`/Users/a/b` → `Users-a-b`).
+ * Cursor-compatible path slug (`/workspace/a/b` → `workspace-a-b`).
  * Used for per-workspace metadata under the host cache.
  */
 export function slugifyWorkspacePath(workspaceRoot: string): string {
@@ -199,9 +199,4 @@ export function ensureOpencodeProjectDir(workspaceRoot: string): string {
       `xdg_cache_home=${process.env.XDG_CACHE_HOME ?? "(unset)"}`,
   )
   return dir
-}
-
-export function resolveHomeRelative(p: string): string {
-  if (p.startsWith("~/")) return path.join(homedir(), p.slice(2))
-  return p
 }
