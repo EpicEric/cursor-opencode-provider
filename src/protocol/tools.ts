@@ -3562,46 +3562,49 @@ export function buildRequestContextResult(
 }
 
 /**
- * Answer Cursor's exec #36 MCP-state probe from the live host tool catalog
- * (the same epoch-held set exec permission uses). OpenCode remains the
- * executor; this only confirms those tools are available, with full
- * name/description/schema so Cursor's native get_mcp_tools can correlate the
- * later provider_identifier/tool_name request.
+ * Answer Cursor's exec #36 MCP-state probe from the session's live tool
+ * descriptors: `toolsToDescriptors` output for the advertised catalog (after
+ * web-tool aliasing), refreshed on every `doStream`. These are the same
+ * identities the names-only RequestContext advertises and exec remap uses, so
+ * Cursor's native get_mcp_tools can correlate the later
+ * provider_identifier/tool_name request. OpenCode remains the executor; this
+ * only confirms those tools are available, with full name/description/schema.
  */
 export function buildMcpStateResult(
   execId: number,
   args: Record<string, unknown>,
-  tools: OpencodeToolDef[],
-  knownMcpServers: Iterable<string> = [],
-  providerIdentifier = "opencode",
+  toolDescriptors: ReadonlyArray<Record<string, unknown>>,
 ): Uint8Array {
   const requested = new Set(
     Array.isArray(args.server_identifiers)
       ? args.server_identifiers.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [],
   )
-  const nested = toolsToMcpDescriptors(tools, providerIdentifier, knownMcpServers)
-  const flatTools = toolsToDescriptors(tools, providerIdentifier, knownMcpServers)
-  const servers = nested
-    .filter((descriptor) => {
-      const id = stringValue(descriptor.server_identifier)
-      return requested.size === 0 || (id !== undefined && requested.has(id))
+  // Group in advertised order: first-seen server, then its tools.
+  const byServer = new Map<string, Array<Record<string, unknown>>>()
+  for (const tool of toolDescriptors) {
+    const server = stringValue(tool.provider_identifier)
+    const toolName = stringValue(tool.tool_name)
+    if (!server || !toolName) continue
+    if (requested.size > 0 && !requested.has(server)) continue
+    let list = byServer.get(server)
+    if (!list) {
+      list = []
+      byServer.set(server, list)
+    }
+    list.push({
+      name: stringValue(tool.name) ?? `${server}-${toolName}`,
+      description: stringValue(tool.description) ?? "",
+      input_schema: tool.input_schema,
+      provider_identifier: server,
+      tool_name: toolName,
     })
-    .map((descriptor) => {
-      const serverIdentifier =
-        stringValue(descriptor.server_identifier) ?? stringValue(descriptor.server_name) ?? ""
-      const listed = Array.isArray(descriptor.tools)
-        ? descriptor.tools
-            .map(recordValue)
-            .filter((tool): tool is Record<string, unknown> => !!tool)
-            .map((tool) => mcpStateToolDefinition(serverIdentifier, tool, flatTools))
-        : []
-      return {
-        server_name: stringValue(descriptor.server_name) ?? serverIdentifier,
-        server_identifier: serverIdentifier,
-        tools: listed,
-      }
-    })
+  }
+  const servers = [...byServer].map(([server, tools]) => ({
+    server_name: server,
+    server_identifier: server,
+    tools,
+  }))
 
   return encodeMessage("AgentClientMessage", {
     exec_client_message: {
@@ -3609,27 +3612,6 @@ export function buildMcpStateResult(
       mcp_state_exec_result: { success: { servers } },
     },
   })
-}
-
-/** Map a nested MCP descriptor onto Cursor's full McpToolDefinition shape. */
-function mcpStateToolDefinition(
-  serverIdentifier: string,
-  descriptor: Record<string, unknown>,
-  flatTools: Array<Record<string, unknown>>,
-): Record<string, unknown> {
-  const toolName = stringValue(descriptor.tool_name) ?? ""
-  const advertised = flatTools.find((tool) =>
-    stringValue(tool.provider_identifier) === serverIdentifier
-      && stringValue(tool.tool_name) === toolName
-  )
-  return {
-    name: stringValue(advertised?.name) ?? `${serverIdentifier}-${toolName}`,
-    description:
-      stringValue(advertised?.description) ?? stringValue(descriptor.description) ?? "",
-    input_schema: advertised?.input_schema ?? descriptor.input_schema,
-    provider_identifier: serverIdentifier,
-    tool_name: toolName,
-  }
 }
 
 /**
@@ -3666,10 +3648,3 @@ export function buildReadMcpResourceFallback(
     },
   })
 }
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined
-}
-

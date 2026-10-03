@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test"
 import { buildRunRequest, buildHeartbeat } from "../src/protocol/request.js"
 import { buildLiveRequestContext } from "../src/protocol/tools.js"
+import { SYSTEM_INSTRUCTIONS_RULE_PATH, systemInstructionsRule } from "../src/context/build.js"
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import { decodeFramePayload, streamFrames } from "../src/protocol/framing.js"
 import { gunzipSync } from "node:zlib"
@@ -196,30 +197,31 @@ describe("buildRunRequest", () => {
     expect(decoded.run_request.requested_model?.max_mode).toBe(true)
   })
 
-  it("delivers system prompt via conversation_state, not custom_system_prompt", () => {
+  it("delivers system context as a global rule, not custom_system_prompt or a seeded system message", () => {
     const data = buildRunRequest({
       text: "Hi",
       modelId: "test-model",
       conversationId: "conv-3",
-      systemPrompt: "You are a helpful assistant.",
+      history: [{ role: "system", content: "You are a helpful assistant." }],
+      requestContext: { rules: [systemInstructionsRule("You are a helpful assistant.")] },
     })
 
     const decoded = decodeMessage<any>("AgentClientMessage", data)
     // The internal --system-prompt field must NOT be used — the server rejects
     // it for non-Anysphere accounts (`unknown option '--system-prompt'`).
     expect(decoded.run_request.custom_system_prompt || "").toBe("")
-    // System prompt rides in conversation_state.root_prompt_messages_json (#1)
-    // as a JSON-encoded {"role":"system","content":...} message.
+    // Cursor does not follow a client-seeded `system` root message.
     const cs = decodeMessage<any>(
       "ConversationStateStructure",
       decoded.run_request.conversation_state,
     )
-    const msgs = cs.root_prompt_messages_json ?? []
-    expect(msgs).toHaveLength(1)
-    expect(JSON.parse(msgs[0])).toEqual({
-      role: "system",
+    expect(cs.root_prompt_messages_json ?? []).toEqual([])
+    const rules = decoded.run_request.action.user_message_action.request_context.rules
+    expect(rules).toEqual([{
+      full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
       content: "You are a helpful assistant.",
-    })
+      type: { global: {} },
+    }])
   })
 
   it("generates a unique message_id each call", () => {
@@ -237,7 +239,6 @@ describe("buildRunRequest", () => {
       text: "What next?",
       modelId: "m",
       conversationId: "conv-hist",
-      systemPrompt: "Be brief.",
     })
     const decoded = decodeMessage<any>("AgentClientMessage", data)
     expect(decoded.run_request.action.user_message_action.user_message.text).toBe(
@@ -247,9 +248,8 @@ describe("buildRunRequest", () => {
       "ConversationStateStructure",
       decoded.run_request.conversation_state,
     )
-    // System only in root_prompt — prior turns live server-side by conversation_id.
-    const root = (cs.root_prompt_messages_json ?? []).map((s: string) => JSON.parse(s))
-    expect(root).toEqual([{ role: "system", content: "Be brief." }])
+    // Prior turns live server-side by conversation_id; no seeded system entry.
+    expect(cs.root_prompt_messages_json ?? []).toEqual([])
     expect(cs.turns ?? []).toHaveLength(0)
   })
 

@@ -2,18 +2,16 @@ import { describe, expect, it } from "bun:test"
 import {
   buildLanguageModelV3UsageFromCounters,
   buildLanguageModelV3UsageFromTurnEnded,
-  DEFAULT_WARM_READ_RATIO,
-  evaluateStickyCacheTurns,
   formatCursorCacheDiagnostics,
   formatCursorTokenCategories,
   formatTurnUsageValidation,
-  parseCacheDiagnosisLine,
   flatUsageFromV3,
   occupancyUsageFromTokenDetails,
   occupancyValidationCounters,
   OPENCODE_DISPLAY_ONLY_COST_METADATA,
   turnEndedCounter,
 } from "../src/usage.js"
+import { evaluateStickyCacheTurns, parseCacheDiagnosisLine, readRatio } from "./cache-diagnosis.js"
 
 describe("turnEndedCounter", () => {
   it("truncates finite non-negative numbers", () => {
@@ -497,136 +495,61 @@ describe("Cursor cache diagnostics", () => {
 })
 
 describe("sticky-session cache diagnosis", () => {
-  const stats = {
-    sessionKey: "ses_cache",
-    conversationId: "conversation-cache",
-    conversationGroupId: "group-cache",
-    modelId: "cursor/default",
-    requestContextHash: "0123456789abcdef-rest",
-    systemPromptHash: "fedcba9876543210-rest",
-    checkpointUpdates: 1,
-    tokenDetailUpdates: 1,
-    pumpPasses: 1,
-    stepStarts: 1,
-    stepCompletes: 1,
-    displayToolCalls: 0,
-    execRequests: 1,
-  } as const
-
-  const seedLine = formatCursorCacheDiagnostics(
-    {
-      inputTokens: 24_000,
-      outputTokens: 100,
-      cacheRead: 20_000,
-      cacheWrite: 0,
-      reasoningTokens: 0,
-    },
+  const line = (
+    inputTokens: number,
+    cacheRead: number,
+    overrides: { warm?: boolean; reused?: boolean; conversationId?: string; requestContextHash?: string } = {},
+  ) => formatCursorCacheDiagnostics(
+    { inputTokens, outputTokens: 10, cacheRead, cacheWrite: 0, reasoningTokens: 0 },
     undefined,
-    undefined,
+    overrides.warm ? { usedTokens: 12_000, maxTokens: 200_000 } : undefined,
     {
-      ...stats,
-      startedWithCheckpoint: false,
-      requestContextReused: false,
+      sessionKey: "ses_cache",
+      conversationId: overrides.conversationId ?? "conversation-cache",
+      conversationGroupId: "group-cache",
+      modelId: "cursor/default",
+      requestContextHash: overrides.requestContextHash ?? "0123456789abcdef-rest",
+      systemPromptHash: "fedcba9876543210-rest",
+      checkpointUpdates: 1,
+      tokenDetailUpdates: 1,
+      pumpPasses: 1,
+      stepStarts: 1,
+      stepCompletes: 1,
+      displayToolCalls: 0,
+      execRequests: 1,
+      startedWithCheckpoint: !!overrides.warm,
+      requestContextReused: overrides.reused ?? !!overrides.warm,
     },
   )
+  const seed = line(24_000, 20_000)
+  const warm = line(24_500, 24_000, { warm: true })
 
-  const warmLine = formatCursorCacheDiagnostics(
-    {
-      inputTokens: 24_500,
-      outputTokens: 20,
-      cacheRead: 24_000,
-      cacheWrite: 0,
-      reasoningTokens: 0,
-    },
-    undefined,
-    {
-      usedTokens: 12_000,
-      maxTokens: 200_000,
-    },
-    {
-      ...stats,
-      startedWithCheckpoint: true,
-      requestContextReused: true,
-    },
-  )
-
-  it("round-trips diagnosis fields from the formatter", () => {
-    const parsed = parseCacheDiagnosisLine(warmLine)
+  it("parses the formatter's fields", () => {
+    const parsed = parseCacheDiagnosisLine(warm)
     expect(parsed).toMatchObject({
       continuity: "warm",
       requestContext: "reused",
-      systemPromptSent: false,
+      systemPromptSent: "false",
       toolsCategoryChurn: "none",
-      rawInput: 24_500,
-      rawCacheRead: 24_000,
+      requestContextHash: "0123456789abcdef",
     })
-    expect(parsed?.rawReadRatio).toBe(0.98)
-    expect(parsed?.requestContextHash).toBe("0123456789abcdef")
+    expect(readRatio(parsed)).toBe(0.98)
   })
 
-  it("passes a seed then warm reused prefix above the ratio bar", () => {
-    const verdict = evaluateStickyCacheTurns([seedLine, warmLine])
-    expect(verdict.ok).toBe(true)
-    expect(verdict.failures).toEqual([])
-    expect(verdict.warm?.rawReadRatio).toBeGreaterThanOrEqual(DEFAULT_WARM_READ_RATIO)
-  })
-
-  it("ignores an interleaved lifecycle Run with a different conversation id", () => {
-    const other = formatCursorCacheDiagnostics(
-      {
-        inputTokens: 8_000,
-        outputTokens: 10,
-        cacheRead: 4_000,
-        cacheWrite: 0,
-        reasoningTokens: 0,
-      },
-      undefined,
-      undefined,
-      {
-        ...stats,
-        conversationId: "conversation-title",
-        startedWithCheckpoint: false,
-        requestContextReused: false,
-      },
-    )
-    const verdict = evaluateStickyCacheTurns([seedLine, other, warmLine])
-    expect(verdict.ok).toBe(true)
+  it("passes a warm reused turn, skipping an interleaved lifecycle Run", () => {
+    const title = line(8_000, 4_000, { conversationId: "conversation-title" })
+    const verdict = evaluateStickyCacheTurns([seed, title, warm])
+    expect(verdict).toMatchObject({ ok: true, failures: [] })
     expect(verdict.seed?.conversationId).toBe("conversation-cache")
   })
 
-  it("fails one-shot cold Runs that never continue", () => {
-    const verdict = evaluateStickyCacheTurns([seedLine])
-    expect(verdict.ok).toBe(false)
-    expect(verdict.failures).toEqual(["no continuity=warm turn"])
-  })
-
-  it("fails a warm Run that rebuilt RequestContext or missed cache", () => {
-    const rebuilt = formatCursorCacheDiagnostics(
-      {
-        inputTokens: 24_500,
-        outputTokens: 20,
-        cacheRead: 10_000,
-        cacheWrite: 0,
-        reasoningTokens: 0,
-      },
-      undefined,
-      {
-        usedTokens: 12_000,
-        maxTokens: 200_000,
-      },
-      {
-        ...stats,
-        startedWithCheckpoint: true,
-        requestContextReused: false,
-        requestContextHash: "ffffffffffffffff-rest",
-      },
-    )
-    const verdict = evaluateStickyCacheTurns([seedLine, rebuilt])
-    expect(verdict.ok).toBe(false)
-    expect(verdict.failures).toEqual(expect.arrayContaining([
-      "warm requestContext=built (expected reused)",
+  it("fails a cold-only Run and a warm Run that rebuilt context or missed cache", () => {
+    expect(evaluateStickyCacheTurns([seed]).failures).toEqual(["no continuity=warm turn"])
+    const rebuilt = line(24_500, 10_000, { warm: true, reused: false, requestContextHash: "ffffffffffffffff-rest" })
+    expect(evaluateStickyCacheTurns([seed, rebuilt]).failures).toEqual([
+      "warm requestContext=built",
       "RequestContext hash changed",
-      expect.stringMatching(/^rawReadRatio /),
-    ]))
+      "rawReadRatio=40.8%",
+    ])
   })
 })

@@ -8,12 +8,7 @@ export {
 } from "./build.js"
 export {
   buildDynamicCatalogRoutingInstruction,
-  buildSkillCatalogChangeReminder,
-  buildSkillCatalogNudge,
-  takeSkillCatalogChangeReminder,
   listAdvertisedMcpServers,
-  skillNameFromAgentSkill,
-  type AgentSkillLike,
 } from "./dynamic-catalog.js"
 export {
   clearFrozenRequestContext,

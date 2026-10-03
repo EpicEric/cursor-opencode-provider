@@ -521,6 +521,7 @@ describe("refreshHeldSessionToolCatalog", () => {
       tools: [
         { type: "function", name: "read", description: "Read", inputSchema: schema },
         { type: "function", name: "abmcp_ab_secret", description: "Secret", inputSchema: schema },
+        { type: "function", name: "websearch", description: "Search", inputSchema: schema },
       ],
     } as LanguageModelV3CallOptions)
 
@@ -532,11 +533,16 @@ describe("refreshHeldSessionToolCatalog", () => {
 
     const result = decodeMessage<{
       exec_client_message: {
-        mcp_state_exec_result: { success: { servers: Array<{ tools: Array<{ tool_name: string }> }> } }
+        mcp_state_exec_result: {
+          success: { servers: Array<{ tools: Array<{ name: string; tool_name: string }> }> }
+        }
       }
-    }>("AgentClientMessage", buildMcpStateResult(3, {}, live.toolCatalog ?? [], live.knownMcpServers ?? []))
+    }>("AgentClientMessage", buildMcpStateResult(3, {}, live.toolDescriptors))
       .exec_client_message.mcp_state_exec_result.success
-    expect(result.servers.flatMap((server) => server.tools.map((tool) => tool.tool_name)))
-      .toContain("ab_secret")
+    const listed = result.servers.flatMap((server) => server.tools)
+    expect(listed.map((tool) => tool.tool_name)).toContain("ab_secret")
+    // #36 names match the aliased names RequestContext advertises.
+    expect(listed.map((tool) => tool.name)).toContain("custom_websearch")
+    expect(listed.map((tool) => tool.tool_name)).not.toContain("websearch")
   })
 })

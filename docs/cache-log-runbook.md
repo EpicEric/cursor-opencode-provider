@@ -18,7 +18,7 @@ The log can prove:
 - whether the Run started from a prior Cursor checkpoint;
 - whether the Cursor conversation and stable conversation group survived;
 - whether the encoded RequestContext stayed byte-identical;
-- whether a system prompt was seeded or the checkpoint was used instead;
+- whether a Run started a new system context (seed/rebase) or resumed the checkpoint;
 - Cursor's exact aggregate input, output, cache-read, and cache-write counters;
 - Cursor's checkpoint-derived context total and category breakdown;
 - how many checkpoint, protocol-step, tool, and exec events occurred;
@@ -138,8 +138,8 @@ cold even though OpenCode still has its own chat history.
 | `requestContext=built` | A new materialized value was used. This is expected on the first Run; on a warm ordinary turn, compare hashes and capability changes. |
 | `requestContextHash` | First 16 hex characters of the encoded RequestContext SHA-256. Equal hashes are strong byte-identity evidence. The full hash appears on `hash requestContext sha256=…`. |
 | `systemPromptHash` | Hash of the current candidate system prompt. Equal hashes show prompt construction was stable. |
-| `systemPromptSent=false` | A checkpoint was sent, so this Run did not seed the system prompt again. The hash is diagnostic only in this case. |
-| `systemPromptSent=true` | This was a seeded/rebased Run and the system prompt was placed in the new conversation state. |
+| `systemPromptSent=false` | A checkpoint was sent, so this Run started no new system context; the frozen system-instructions rule from the conversation's first Run went out unchanged. The hash is diagnostic only in this case. |
+| `systemPromptSent=true` | This was a seeded/rebased Run: its system context became the new conversation's frozen system-instructions rule in RequestContext (never a seeded `system` message). |
 
 The checkpoint hash is expected to change as the conversation changes. Do not
 use checkpoint-hash equality as the definition of prompt-cache reuse.

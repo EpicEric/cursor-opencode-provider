@@ -81,7 +81,7 @@ Parity target is interactive `cursor-agent` (`Run` client: TUI and `--print`). `
 
 | Feature | Cursor CLI | This provider | Match |
 |---|---|---|---|
-| Rules (AGENTS.md/CLAUDE.md/CONTEXT.md, global config, instructions globs) | Native | Host system prompt; not copied into RequestContext | 🔶 |
+| Rules (AGENTS.md/CLAUDE.md/CONTEXT.md, global config, instructions globs) | Native | OpenCode's system prompt as one `global` (alwaysApply) rule, like the CLI's AGENTS.md | ✅ |
 | Skills, agents, plugins discovery | Native | Skills/agents via host tools; plugins still collected for `hooks_additional_context` | 🔶 |
 | Git + layout + env + terminal epochs | Native (direnv, terminal env) | Git/layout/env; no terminal-state epochs | 🔶 |
 | Slash commands / custom modes | Native | Not sent as context | ❌ |

@@ -368,10 +368,10 @@ describe("extractPromptHistory", () => {
 })
 
 describe("buildSeedConversationState history", () => {
-  it("embeds system + history into root_prompt_messages_json", () => {
+  it("embeds history into root_prompt_messages_json and drops system entries", () => {
     const bytes = buildSeedConversationState({
-      systemPrompt: "sys",
       history: [
+        { role: "system", content: "sys" },
         { role: "user", content: "hi" },
         { role: "assistant", content: "hello" },
       ],
@@ -379,7 +379,6 @@ describe("buildSeedConversationState history", () => {
     const cs = decodeMessage<any>("ConversationStateStructure", bytes)
     const root = (cs.root_prompt_messages_json ?? []).map((s: string) => JSON.parse(s))
     expect(root).toEqual([
-      { role: "system", content: "sys" },
       { role: "user", content: "hi" },
       { role: "assistant", content: "hello" },
     ])

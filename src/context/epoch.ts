@@ -4,11 +4,13 @@
  * Mirrors OpenCode research CONTEXT.md:
  * - One Baseline System Context per conversation_id (provider-cache prefix)
  * - Later Context Source changes → Mid-Conversation System Message on the
- *   user turn (Cursor checkpoint Runs cannot rewrite systemPrompt)
+ *   user turn; the baseline itself never changes within the epoch
  * - Epoch ends on conversation remint (compaction / post-compaction rebase)
  *
- * Cursor constraint: systemPrompt is only sent on seed Runs. Checkpointed
- * Runs admit updates exclusively via the live user message.
+ * The baseline reaches Cursor as the frozen system-instructions rule in
+ * RequestContext (`systemInstructionsRule`), on every Run. `seedSystemPrompt`
+ * marks the Runs that start a conversation; it is not sent as a `system`
+ * message, which Cursor does not follow.
  */
 import { createHash } from "node:crypto"
 import { trace } from "../debug.js"

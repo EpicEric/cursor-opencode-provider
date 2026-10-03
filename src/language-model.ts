@@ -174,6 +174,7 @@ import {
 } from "./errors.js"
 import { readCache, cacheFilePath, resolveVariantParameters, resolveVariantMaxMode, extractCursorVariantParameters, resolveCursorWireModelId, type ModelInfo } from "./models.js"
 import { getOrBuildRequestContext } from "./context/frozen.js"
+import type { SystemInstructions } from "./context/build.js"
 import { loadMergedConfig } from "./context/rules.js"
 import {
   buildDynamicCatalogRoutingInstruction,
@@ -1199,10 +1200,11 @@ async function startSession(
     workspaceRoot: options.workspaceRoot,
   })
   const baseSystemPrompt = extractSystemPrompt(prompt)
-  // One merged-config load per Run: guidance MCP ids and RequestContext
-  // descriptors must agree, and warm turns must not pay for a second disk read.
-  const mergedConfig = isCompaction ? undefined : await loadMergedConfig(workspaceRoot)
-  const knownMcpServers = Object.keys(mergedConfig?.mcp ?? {})
+  // One merged-config load per Run: RequestContext names, session descriptors
+  // (exec remap, exec #36) and guidance MCP ids must agree on server identity,
+  // and warm turns must not pay for a second disk read.
+  const mergedConfig = await loadMergedConfig(workspaceRoot)
+  const knownMcpServers = Object.keys(mergedConfig.mcp ?? {})
   const interactionGuidance = buildOpenCodeInteractionGuidance(cursorTools, isCompaction, workspaceRoot, {
     knownMcpServers,
   })
@@ -1306,7 +1308,12 @@ async function startSession(
     kickoffWarning ? `<system_reminder>${kickoffWarning}</system_reminder>` : undefined,
   ].filter((part): part is string => !!part)
 
+  // `systemPrompt` is the host system context composed for a seed Run (kept for
+  // diagnostics and size estimates). It reaches Cursor only as the frozen
+  // system-instructions rule in RequestContext, never as a seeded `system`
+  // message, which Cursor does not follow.
   let systemPrompt: string | undefined
+  let systemInstructions: SystemInstructions | undefined
   if (isCompaction || lifecycle) {
     // Ephemeral summary/title Runs — do not initialize a sticky Context Epoch.
     systemPrompt = startedWithCheckpoint
@@ -1315,6 +1322,9 @@ async function startSession(
     if (startedWithCheckpoint && oneShotReminders.length) {
       userText = appendMidConversationMessage(userText, oneShotReminders.join("\n\n"))
     }
+    const ephemeralText = systemPrompt
+      ?? [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
+    if (ephemeralText) systemInstructions = { text: ephemeralText, authoritative: true }
   } else {
     const admitted = admitContextEpoch({
       conversationId,
@@ -1327,6 +1337,15 @@ async function startSession(
     })
     systemPrompt = startedWithCheckpoint ? undefined : admitted.seedSystemPrompt
     userText = appendMidConversationMessage(userText, admitted.midConversationMessage)
+    // The epoch baseline is the rule for every Run of this conversation. A
+    // recovered epoch (restart past a checkpoint) has no baseline bytes: keep
+    // the persisted rule, and use the live context only if none was persisted.
+    const frozenBaseline = admitted.epoch.baselineSystemPrompt
+    const instructionText = frozenBaseline
+      || [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
+    if (instructionText) {
+      systemInstructions = { text: instructionText, authoritative: !!frozenBaseline }
+    }
     // A recovered epoch has no baseline bytes. Keep the hash restored from
     // the checkpoint snapshot so this turn's TurnEnded save does not drop it.
     const previousIdentity = sessionKey ? promptIdentityBySession.get(sessionKey) : undefined
@@ -1437,7 +1456,7 @@ async function startSession(
   // Run mutates volatile slices (git porcelain, layout) and breaks prompt cache.
   const { context: requestContext, reused: requestContextReused } = await getOrBuildRequestContext(
     conversationId,
-    { workspaceRoot, tools: cursorTools, mergedConfig },
+    { workspaceRoot, tools: cursorTools, mergedConfig, systemInstructions },
   )
   // Skills live in the host system prompt and `skill` tool. Do not scan disk or
   // emit RequestContext `agent_skills` Mid-Conversation XML; host `<system-update>`
@@ -1473,7 +1492,6 @@ async function startSession(
     modelId: cursorModelId,
     conversationId,
     conversationGroupId,
-    systemPrompt: conversationState ? undefined : systemPrompt,
     history: conversationState ? undefined : history,
     conversationState,
     parameterValues,
@@ -1486,9 +1504,6 @@ async function startSession(
   // Content hashes — Cursor content-addresses large payloads; logging these lets
   // us match a server get_blob_args.blob_id to what it wants served.
   const sha = (b: string | Uint8Array) => createHash("sha256").update(b).digest("hex")
-  const skillsCount = Array.isArray(requestContext.agent_skills)
-    ? requestContext.agent_skills.length
-    : 0
   const hooksCtx =
     typeof requestContext.hooks_additional_context === "string"
       ? requestContext.hooks_additional_context
@@ -1523,7 +1538,7 @@ async function startSession(
       `params=${JSON.stringify(parameterValues ?? [])} ` +
       `maxMode=${maxMode} systemPromptLen=${systemPrompt?.length ?? 0} ` +
       `tools=${tools.length} incomingTools=${incomingTools.length} compaction=${isCompaction} ` +
-      `skills=${skillsCount} hooks=${hooksCtx ? hooksCtx.split("\n").length : 0} ` +
+      `hooks=${hooksCtx ? hooksCtx.split("\n").length : 0} ` +
       `availableModels=${_availableModels?.length ?? 0} userTextLen=${userText.length} ` +
       `images=${images.length} imageBytes=${images.reduce((total, image) => total + image.data.length, 0)} ` +
       `historyMsgs=${history.length} historyChars=${historyChars} ` +
@@ -3421,15 +3436,14 @@ export async function pump(
       cacheDiagnostics.execRequests++
       const esmId = (esm.id as number) ?? 0
       if (esm.request_context_args) {
-        // Server turn-setup probe (#10). Reply with full OpenCode-sourced context.
+        // Server turn-setup probe (#10). Reply with the same RequestContext the Run sent.
         {
           const rc = session.requestContext
-          const skills = Array.isArray(rc.agent_skills) ? rc.agent_skills.length : 0
           const hooks =
             typeof rc.hooks_additional_context === "string" ? rc.hooks_additional_context : ""
           trace(
             `exec request_context: id=${esmId} — replying context ` +
-              `tools=${session.toolDescriptors.length} skills=${skills} ` +
+              `tools=${session.toolDescriptors.length} ` +
               `hooks=${hooks ? hooks.split("\n").length : 0}`,
           )
           if (hooks) trace(`exec request_context hooks_additional_context: ${hooks}`)
@@ -3461,12 +3475,7 @@ export async function pump(
         try {
           await writeWithBackpressure(
             session.stream,
-            buildMcpStateResult(
-              esmId,
-              stateArgs,
-              session.toolCatalog ?? [],
-              session.knownMcpServers ?? [],
-            ),
+            buildMcpStateResult(esmId, stateArgs, session.toolDescriptors),
             `MCP-state reply id=${esmId}`,
           )
           trace(`exec mcp_state: replied id=${esmId} requested=[${requested}]`)
@@ -4238,9 +4247,8 @@ function extractSystemPrompt(prompt: LanguageModelV3CallOptions["prompt"]): stri
 }
 
 /**
- * Checkpointed Runs do not resend the system prompt. Keep the workspace root
- * on the live user message, and require absolute `path` arguments when that is
- * the host's file-tool dialect.
+ * Keep the workspace root on a checkpointed turn's live user message too, and
+ * require absolute `path` arguments when that is the host's file-tool dialect.
  */
 export function groundCheckpointTurnText(
   userText: string,
@@ -4629,7 +4637,9 @@ export { sessionIdToUuid } from "./protocol/conversation-bind.js"
 /**
  * Grow the held Run's advertised + permitted catalog from this `doStream`
  * call. Continuation skips `startSession`, so without this, exec #36 and
- * permission keep the freeze from Run open.
+ * permission keep the freeze from Run open. MCP server ids stay those of the
+ * Run's one merged-config load (`startSession`); a tool that connects later
+ * still gets its identity from that set.
  */
 export async function refreshHeldSessionToolCatalog(
   session: CursorSession,
@@ -4651,12 +4661,7 @@ export async function refreshHeldSessionToolCatalog(
   })
   const webToolAliases = buildCustomWebToolAliases(toolState.advertisedTools)
   const cursorTools = webToolAliases.advertisedTools
-  const workspaceRoot = workspaceRootFromRequestContext(session.requestContext)
-  const mergedConfig = isCompaction ? undefined : await loadMergedConfig(workspaceRoot)
-  const knownMcpServers = [...new Set([
-    ...(session.knownMcpServers ?? []),
-    ...Object.keys(mergedConfig?.mcp ?? {}),
-  ])]
+  const knownMcpServers = session.knownMcpServers ?? []
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
   const contextSubagents = Array.isArray(session.requestContext.custom_subagents)
     ? session.requestContext.custom_subagents
@@ -4670,13 +4675,10 @@ export async function refreshHeldSessionToolCatalog(
           : undefined)
         .filter((agent): agent is { name: string; description: string | undefined } => !!agent)
     : []
-  session.knownMcpServers = knownMcpServers
-  session.toolCatalog = sessionKey
-    ? snapshotToolCatalog(sessionKey)
-    : structuredClone(toolState.advertisedTools)
+  session.toolCatalog = snapshotToolCatalog(sessionKey)
   session.toolDescriptors = toolsToDescriptors(cursorTools, "opencode", knownMcpServers)
   session.toolAliases = webToolAliases.aliases
-  session.hostToolDialect = hostToolDialectFromTools(cursorTools, session.hostToolDialect)
+  session.hostToolDialect = hostToolDialectFromTools(toolState.advertisedTools, session.hostToolDialect)
   session.subagentCatalog = {
     ...discoveredSubagentCatalog,
     agents: [...new Map(

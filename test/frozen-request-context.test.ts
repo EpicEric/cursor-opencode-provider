@@ -4,6 +4,8 @@ import path from "node:path"
 import os from "node:os"
 import { createHash } from "node:crypto"
 import { buildRequestContextResult } from "../src/protocol/tools.js"
+import { decodeMessage } from "../src/protocol/messages.js"
+import { SYSTEM_INSTRUCTIONS_RULE_PATH } from "../src/context/build.js"
 import {
   clearFrozenRequestContext,
   getFrozenRequestContext,
@@ -383,6 +385,82 @@ describe("frozen request_context", () => {
     expect(added.context).toBe(first.context)
 
     await rm(skillDir, { recursive: true, force: true })
+  })
+
+  describe("system-instructions rule", () => {
+    const rule = (text: string) => ({
+      full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
+      content: text,
+      type: { global: {} },
+    })
+
+    it("freezes the host system context as one global rule on every Run", async () => {
+      const conversationId = "conv-system-rule"
+      const systemInstructions = { text: "Host prompt\n\nGuidance", authoritative: true }
+      const first = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(first.context.rules).toEqual([rule("Host prompt\n\nGuidance")])
+      // Checkpoint Run: same epoch baseline, same bytes, reused object.
+      const again = await getOrBuildRequestContext(conversationId, { workspaceRoot: root, systemInstructions })
+      expect(again.reused).toBe(true)
+      expect(again.context).toBe(first.context)
+      // Wire encoding keeps the rule type (an untyped rule is never applied).
+      const wire = decodeMessage<any>("AgentClientMessage", encodeRequestContext(again.context))
+      expect(wire.exec_client_message.request_context_result.success.request_context.rules)
+        .toEqual([rule("Host prompt\n\nGuidance")])
+    })
+
+    it("replaces the rule for a new epoch baseline but not for a recovered epoch", async () => {
+      const conversationId = "conv-system-rule-epoch"
+      await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "baseline A", authoritative: true },
+      })
+      const recovered = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "live text", authoritative: false },
+      })
+      expect(recovered.context.rules).toEqual([rule("baseline A")])
+      const reseeded = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "baseline B", authoritative: true },
+      })
+      expect(reseeded.context.rules).toEqual([rule("baseline B")])
+    })
+
+    it("fills a persisted base that has no rule and drops legacy untyped rules", async () => {
+      const conversationId = "conv-system-rule-legacy"
+      setFrozenRequestContext(conversationId, {
+        rules: [{ full_path: "/tmp/AGENTS.md", content: "# untyped, never applied" }],
+        env: { workspace_paths: [root] },
+      })
+      const filled = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "live text", authoritative: false },
+      })
+      expect(filled.context.rules).toEqual([rule("live text")])
+    })
+
+    it("survives a durable restart byte-identically", async () => {
+      const sessionKey = "ses-system-rule-restart"
+      const conversationId = bindConversationId(sessionKey).conversationId
+      const first = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "frozen baseline", authoritative: true },
+      })
+      await persistConversationState(cacheRoot, { sessionKey, conversationId, requestContext: first.context })
+      resetConversationPersistenceForTests()
+      resetConversationBindingsForTests()
+      resetFrozenRequestContextsForTests()
+
+      await hydrateConversationState(cacheRoot, sessionKey)
+      // After restart the epoch is recovered (no baseline bytes): live text must not win.
+      const rebuilt = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "changed live text", authoritative: false },
+      })
+      expect(rebuilt.context.rules).toEqual([rule("frozen baseline")])
+      expect(sha(encodeRequestContext(rebuilt.context))).toBe(sha(encodeRequestContext(first.context)))
+    })
   })
 
   it("strips rules from a hydrated frozen base", async () => {

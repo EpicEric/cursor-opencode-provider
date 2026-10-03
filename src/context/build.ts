@@ -28,6 +28,79 @@ export type BuildRequestContextInput = {
    * guidance MCP server ids). Skips a second `loadMergedConfig` disk read.
    */
   mergedConfig?: OpencodeJson
+  /** Host system context to deliver as the frozen system-instructions rule. */
+  systemInstructions?: SystemInstructions
+}
+
+/**
+ * Host system context (OpenCode's system prompt plus this provider's
+ * interaction guidance) for one Cursor conversation.
+ */
+export type SystemInstructions = {
+  text: string
+  /**
+   * True when `text` is this conversation's own frozen baseline (a Context
+   * Epoch started in this process, or an ephemeral Run's prompt): it replaces
+   * any rule already frozen. False when a restart recovered the epoch without
+   * its bytes: the persisted rule wins and `text` only fills a missing one.
+   */
+  authoritative: boolean
+}
+
+/** Rule name Cursor shows for the host system context (not a file). */
+export const SYSTEM_INSTRUCTIONS_RULE_PATH = "OpenCode system instructions"
+
+/**
+ * Cursor does not follow a client-seeded `system` message, and applies a rule
+ * only by its type. The Cursor CLI sends AGENTS.md as `alwaysApply`
+ * (`CursorRuleType.global`) and the IDE ships its own guidance as a non-file
+ * global rule; the host system context goes out the same way, once, frozen
+ * with the RequestContext base.
+ */
+export function systemInstructionsRule(text: string): Record<string, unknown> {
+  return {
+    full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
+    content: text,
+    type: { global: {} },
+  }
+}
+
+function isSystemInstructionsRule(rule: unknown): rule is Record<string, unknown> {
+  if (!rule || typeof rule !== "object") return false
+  const record = rule as Record<string, unknown>
+  const type = record.type as Record<string, unknown> | undefined
+  return record.full_path === SYSTEM_INSTRUCTIONS_RULE_PATH && !!type?.global
+    && typeof record.content === "string"
+}
+
+/** Text of the frozen system-instructions rule, if the context carries one. */
+export function systemInstructionsRuleText(context: Record<string, unknown>): string | undefined {
+  const rules = Array.isArray(context.rules) ? context.rules : []
+  const rule = rules.find(isSystemInstructionsRule)
+  return rule ? rule.content as string : undefined
+}
+
+/**
+ * Return `context` with the system-instructions rule applied, or the same
+ * object when nothing changes (see `SystemInstructions.authoritative`).
+ */
+export function withSystemInstructions(
+  context: Record<string, unknown>,
+  instructions: SystemInstructions | undefined,
+): Record<string, unknown> {
+  const text = instructions?.text.trim() ? instructions.text : undefined
+  if (!text) return context
+  const current = systemInstructionsRuleText(context)
+  if (current !== undefined && (current === text || !instructions!.authoritative)) return context
+  return { ...context, rules: [systemInstructionsRule(text)] }
+}
+
+/** Keep only the system-instructions rule; older bases carried untyped rules Cursor never applied. */
+function keepSystemInstructionsRule(context: Record<string, unknown>): void {
+  if (!Object.hasOwn(context, "rules")) return
+  const rules = Array.isArray(context.rules) ? context.rules.filter(isSystemInstructionsRule) : []
+  if (rules.length > 0) context.rules = rules.slice(0, 1)
+  else delete context.rules
 }
 
 export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
@@ -45,9 +118,11 @@ export const DYNAMIC_REQUEST_CONTEXT_KEYS = [
 
 export type DynamicRequestContextKey = typeof DYNAMIC_REQUEST_CONTEXT_KEYS[number]
 
-/** Host system prompt already carries these; never keep them on a frozen base. */
+/**
+ * The host system context (delivered as the system-instructions rule) already
+ * carries these; never keep them on a frozen base.
+ */
 export const HOST_DUPLICATED_REQUEST_CONTEXT_KEYS = [
-  "rules",
   "agent_skills",
   "agent_skills_info_complete",
 ] as const
@@ -69,12 +144,14 @@ function buildAdvertisedSubagentCatalog(
 
 function stripHostDuplicatedRequestContextFields(context: Record<string, unknown>): void {
   for (const key of HOST_DUPLICATED_REQUEST_CONTEXT_KEYS) delete context[key]
+  keepSystemInstructionsRule(context)
 }
 
 /**
  * Full RequestContext payload for live UMA + exec #10 reply.
- * Workspace env/git/layout plus host-advertised tools and subagents.
- * The provider never looks in Cursor's own directories.
+ * Workspace env/git/layout, the host system-instructions rule, and
+ * host-advertised tools and subagents. The provider never looks in Cursor's
+ * own directories.
  */
 export async function buildRequestContext(
   input: BuildRequestContextInput,
@@ -87,7 +164,7 @@ export async function buildRequestContext(
     collectProjectLayout(workspaceRoot),
   ])
 
-  const base: Record<string, unknown> = {
+  const workspace: Record<string, unknown> = {
     env: buildEnv(workspaceRoot),
     repository_info: git.repositoryInfo,
     git_repos: git.gitRepos,
@@ -98,6 +175,7 @@ export async function buildRequestContext(
     git_repo_info_complete: true,
     git_status_info_complete: true,
   }
+  const base = withSystemInstructions(workspace, input.systemInstructions)
   const ctx = materializeRequestContext(base, dynamic)
 
   traceRequestContextPaths("buildRequestContext", ctx)
@@ -130,11 +208,10 @@ async function buildDynamicRequestContextFromDiscovery(
   }))
   const overlay = input.conversationId
     ? holdCapabilityOverlay(input.conversationId, {
-        skills: [],
         subagents: customSubagents,
         plugins: livePlugins,
       })
-    : { skills: [], subagents: customSubagents, plugins: livePlugins }
+    : { subagents: customSubagents, plugins: livePlugins }
 
   const dynamic: Record<string, unknown> = {
     mcp_file_system_options: {

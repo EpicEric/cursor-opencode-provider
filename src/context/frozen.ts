@@ -3,6 +3,7 @@ import {
   buildRequestContext,
   materializeRequestContext,
   requestContextBase,
+  withSystemInstructions,
   type BuildRequestContextInput,
 } from "./build.js"
 import { clearContextEpoch, endContextEpoch, resetContextEpochsForTests } from "./epoch.js"
@@ -11,11 +12,6 @@ import {
   resetOverlayHoldsForTests,
   transferOverlayHold,
 } from "./overlay.js"
-import {
-  clearSkillCatalogAdmission,
-  resetSkillCatalogAdmissionsForTests,
-  transferSkillCatalogAdmission,
-} from "./dynamic-catalog.js"
 import { trace } from "../debug.js"
 import { encodeMessage } from "../protocol/messages.js"
 
@@ -62,7 +58,6 @@ function remember(conversationId: string, context: Record<string, unknown>): voi
     byConversationId.delete(oldest)
     materializedByConversationId.delete(oldest)
     clearOverlayHold(oldest)
-    clearSkillCatalogAdmission(oldest)
   }
 }
 
@@ -92,7 +87,6 @@ export function clearFrozenRequestContext(conversationId: string): void {
   byConversationId.delete(conversationId)
   materializedByConversationId.delete(conversationId)
   clearOverlayHold(conversationId)
-  clearSkillCatalogAdmission(conversationId)
   clearContextEpoch(conversationId)
 }
 
@@ -113,12 +107,11 @@ export function transferFrozenRequestContext(
   const base = byConversationId.get(previousConversationId)
   const materialized = materializedByConversationId.get(previousConversationId)
   // System Context epoch does not transfer — compaction starts a fresh baseline.
-  // Overlay hold does transfer: same workspace, same advertised skill/agent/plugin
+  // Overlay hold does transfer: same workspace, same advertised agent/plugin
   // bytes, so the comparison seed can still match. clearFrozenRequestContext
   // also drops epoch state for each id.
   endContextEpoch(previousConversationId, nextConversationId)
   transferOverlayHold(previousConversationId, nextConversationId)
-  transferSkillCatalogAdmission(previousConversationId, nextConversationId)
   byConversationId.delete(previousConversationId)
   materializedByConversationId.delete(previousConversationId)
   byConversationId.delete(nextConversationId)
@@ -140,7 +133,6 @@ export function resetFrozenRequestContextsForTests(): void {
   materializedByConversationId.clear()
   buildsByConversationId.clear()
   resetOverlayHoldsForTests()
-  resetSkillCatalogAdmissionsForTests()
   resetContextEpochsForTests()
 }
 
@@ -194,8 +186,21 @@ export async function getOrBuildRequestContext(
   const scoped = conversationId ? { ...input, conversationId } : input
   if (opts?.refresh && conversationId) clearOverlayHold(conversationId)
   if (!opts?.refresh && conversationId) {
-    const base = getFrozenRequestContext(conversationId)
+    let base = getFrozenRequestContext(conversationId)
     if (base) {
+      // The system-instructions rule is frozen with the base. A new epoch
+      // baseline (compaction rebase, binding reset) replaces it; a recovered
+      // epoch only fills a base persisted without one.
+      const instructed = withSystemInstructions(base, input.systemInstructions)
+      if (instructed !== base) {
+        setFrozenRequestContext(conversationId, instructed)
+        base = getFrozenRequestContext(conversationId)!
+        trace(
+          `request_context: system instructions frozen conversationId=${conversationId} ` +
+            `len=${input.systemInstructions?.text.length ?? 0} ` +
+            `authoritative=${input.systemInstructions?.authoritative ?? false}`,
+        )
+      }
       const dynamic = await buildDynamicRequestContext(scoped)
       const materialized = rememberMaterialized(
         conversationId,
