@@ -21,7 +21,7 @@ import {
   resolveCursorWireModelId,
   type ModelCache,
 } from "../src/models.js"
-import { modelInfoToConfig, modelsToConfig } from "../src/plugin.js"
+import { modelInfoToConfig, modelsToConfig } from "../src/model-config.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 
 const tempDirs: string[] = []

@@ -8,7 +8,7 @@
  * OpenCode 1.x continues to use advertised `plan_enter` / `plan_exit` tools.
  */
 
-import { trace } from "./debug.js"
+import { errorMessage, trace } from "./debug.js"
 
 export type HostAgentModeSwitchInput = {
   sessionID: string
@@ -111,7 +111,7 @@ export async function flushHostAgentModeSwitch(
     delete state.cursorSessionID
     trace(
       `host-agent-mode: FAILED sessionID=${key} target=${state.targetModeID} ` +
-        `attempts=${state.attempts} err=${error instanceof Error ? error.message : String(error)}`,
+        `attempts=${state.attempts} err=${errorMessage(error)}`,
     )
     return false
   }

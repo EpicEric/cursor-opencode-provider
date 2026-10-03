@@ -1,8 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test"
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test"
 import { mkdir, writeFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { CursorPlugin, modelInfoToConfig, thinkingSuffixBaseNames } from "../src/plugin.js"
+import { CursorPlugin } from "../src/plugin.js"
+import { modelInfoToConfig, thinkingSuffixBaseNames } from "../src/model-config.js"
+import { isExpiringSoon } from "../src/auth.js"
+import { resetAuthRenewalState } from "../src/auth-renewal.js"
+import { CursorAuthError } from "../src/errors.js"
 import { CURSOR_VARIANT_PARAMETERS_KEY, readCache, writeCache, type ModelInfo } from "../src/models.js"
 import { resetClientVersionCache } from "../src/protocol/client-version.js"
 import { resetAgentUrlCache } from "../src/agent-url.js"
@@ -41,7 +45,7 @@ describe("package root exports", () => {
   })
 
   it("loads classic tools from a Windows absolute host path", async () => {
-    const { loadClassicTools } = await import("../src/plugin.js")
+    const { loadClassicTools } = await import("../src/classic-tools.js")
     const seen: string[] = []
     const schema = {
       string: () => ({ describe() { return this }, optional() { return this } }),
@@ -62,7 +66,7 @@ describe("package root exports", () => {
   })
 
   it("falls back to plain classic definitions when no helper can be imported", async () => {
-    const { loadClassicTools } = await import("../src/plugin.js")
+    const { loadClassicTools } = await import("../src/classic-tools.js")
     const tools = await loadClassicTools({
       configDirs: ["/missing"],
       importModule: async () => { throw new Error("missing") },
@@ -73,6 +77,13 @@ describe("package root exports", () => {
 
   it("keeps runtime root exports safe for OpenCode's legacy plugin loader", () => {
     expect(Object.keys(rootExports).sort()).toEqual(["CursorPlugin", "createCursor", "default"])
+  })
+
+  it("exports only CursorPlugin from the classic plugin module", async () => {
+    // OpenCode 1.x calls every export of a `file://…/dist/plugin.js` module as a
+    // plugin (`getLegacyPlugins`); a helper export there fails plugin load.
+    const pluginModule = await import("../src/plugin.js")
+    expect(Object.keys(pluginModule)).toEqual(["CursorPlugin"])
   })
 
   it("registers web search under a non-reserved OpenCode tool id", async () => {
@@ -579,14 +590,35 @@ describe("CursorPlugin config hook", () => {
 function fakeJwt(expOffsetSec: number): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64")
   const payload = Buffer.from(
-    JSON.stringify({ exp: Math.floor(Date.now() / 1000) + expOffsetSec }),
+    JSON.stringify({ exp: Math.floor(Date.now() / 1000) + expOffsetSec, n: Math.random() }),
   ).toString("base64")
   return `${header}.${payload}.sig`
 }
 
+/** Cursor browser-login session JWT: 60-day life, issue time in `time`. */
+function sessionJwt(issuedAgoSec: number): string {
+  const issued = Math.floor(Date.now() / 1000) - issuedAgoSec
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
+  const payload = Buffer.from(JSON.stringify({
+    type: "session",
+    time: String(issued),
+    exp: issued + 60 * 86_400,
+    randomness: Math.random().toString(36),
+  })).toString("base64url")
+  return `${header}.${payload}.sig`
+}
+
+const DAY_S = 86_400
+
 const INSTALLER_FIXTURE = `
 DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.09-a3815c0/\${OS}/\${ARCH}/agent-cli-package.tar.gz"
 `
+
+type LoaderOptions = Record<string, unknown> & {
+  accessToken?: string
+  apiKey?: string
+  getAccessToken?: (request?: { forceRefresh?: boolean }) => Promise<string>
+}
 
 describe("loadModels on cache miss", () => {
   let fakeHome: string
@@ -597,26 +629,46 @@ describe("loadModels on cache miss", () => {
   let availableModelsCalls: number
   let serverConfigCalls: number
   let serverConfigBodies: string[]
+  /** `POST /oauth/token` session renewals. */
   let refreshCalls: number
+  /** Calls to the removed `/auth/token` route; must stay 0. */
+  let legacyRefreshCalls: number
+  let exchangeKeys: string[]
+  let sessionResponse: () => Response | Promise<Response>
+  let exchangeResponse: () => Response
   let persisted: unknown[]
+  let persistAttempts: number
 
   async function writeAuth(cursor: unknown): Promise<void> {
     await mkdir(dataDir, { recursive: true })
     await writeFile(path.join(dataDir, "auth.json"), JSON.stringify({ cursor }))
   }
 
-  function pluginInput() {
+  /** Plugin input whose `auth.set` also updates auth.json, as OpenCode does. */
+  function pluginInput(options: { failPersist?: boolean } = {}) {
     return {
       directory: projectDir,
       client: {
         auth: {
           set: async (opts: { body: unknown }) => {
+            persistAttempts += 1
+            if (options.failPersist) throw new Error("auth.set failed")
             persisted.push(opts.body)
+            await writeAuth(opts.body)
             return { data: true }
           },
         },
       },
     } as never
+  }
+
+  async function runLoader(
+    plugin: Awaited<ReturnType<typeof CursorPlugin>>,
+    getAuth: () => Promise<unknown>,
+  ): Promise<LoaderOptions> {
+    const auth = plugin.auth
+    if (!auth || !("loader" in auth) || !auth.loader) throw new Error("missing loader")
+    return await auth.loader(getAuth as never, {} as never) as LoaderOptions
   }
 
   beforeEach(async () => {
@@ -634,19 +686,31 @@ describe("loadModels on cache miss", () => {
     serverConfigCalls = 0
     serverConfigBodies = []
     refreshCalls = 0
+    legacyRefreshCalls = 0
+    exchangeKeys = []
+    sessionResponse = () => Response.json({ access_token: sessionJwt(0), id_token: "id", shouldLogout: false })
+    exchangeResponse = () => Response.json({ accessToken: fakeJwt(3600), refreshToken: "exchanged-refresh" })
     persisted = []
+    persistAttempts = 0
     realFetch = globalThis.fetch
     resetClientVersionCache()
     resetAgentUrlCache()
+    resetAuthRenewalState()
 
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.includes("/auth/token")) {
+      if (url.includes("/oauth/token")) {
         refreshCalls += 1
-        return Response.json({
-          accessToken: fakeJwt(3600),
-          refreshToken: "new-refresh",
-        })
+        return sessionResponse()
+      }
+      if (url.includes("/auth/token")) {
+        legacyRefreshCalls += 1
+        return new Response("Route POST:/auth/token not found", { status: 404 })
+      }
+      if (url.includes("/auth/exchange_user_api_key")) {
+        const authorization = new Headers(init?.headers).get("authorization") ?? ""
+        exchangeKeys.push(authorization.replace(/^Bearer /, ""))
+        return exchangeResponse()
       }
       if (url.includes("AvailableModels")) {
         availableModelsCalls += 1
@@ -672,15 +736,17 @@ describe("loadModels on cache miss", () => {
     globalThis.fetch = realFetch
     resetClientVersionCache()
     resetAgentUrlCache()
+    resetAuthRenewalState()
+    expect(legacyRefreshCalls).toBe(0)
     await rm(fakeHome, { recursive: true, force: true })
   })
 
   it("fetches and caches models when oauth auth exists and cache is empty", async () => {
     await writeAuth({
       type: "oauth",
-      access: fakeJwt(3600),
+      access: sessionJwt(DAY_S),
       refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
+      expires: Date.now() + 59 * DAY_S * 1000,
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -700,9 +766,9 @@ describe("loadModels on cache miss", () => {
     })
     await writeAuth({
       type: "oauth",
-      access: fakeJwt(3600),
+      access: sessionJwt(DAY_S),
       refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
+      expires: Date.now() + 59 * DAY_S * 1000,
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -718,12 +784,13 @@ describe("loadModels on cache miss", () => {
     })
   })
 
-  it("refreshes expired oauth, preserves extras, then fetches models", async () => {
+  it("renews a due session at startup through /oauth/token, preserving extras", async () => {
+    const old = sessionJwt(16 * DAY_S)
     await writeAuth({
       type: "oauth",
-      access: fakeJwt(-60),
-      refresh: "old-refresh",
-      expires: Date.now() - 60_000,
+      access: old,
+      refresh: old,
+      expires: Date.now() + 44 * DAY_S * 1000,
       accountId: "acct-1",
       enterpriseUrl: "https://enterprise.example",
     })
@@ -734,14 +801,13 @@ describe("loadModels on cache miss", () => {
 
     expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
     expect(refreshCalls).toBe(1)
-    expect(availableModelsCalls).toBe(1)
     expect(persisted).toHaveLength(1)
-    expect(persisted[0]).toMatchObject({
-      type: "oauth",
-      refresh: "new-refresh",
-      accountId: "acct-1",
-      enterpriseUrl: "https://enterprise.example",
-    })
+    const saved = persisted[0] as { access: string; refresh: string; expires: number }
+    expect(saved).toMatchObject({ type: "oauth", accountId: "acct-1", enterpriseUrl: "https://enterprise.example" })
+    expect(saved.access).not.toBe(old)
+    // Cursor's IDE stores the renewed session token as both.
+    expect(saved.refresh).toBe(saved.access)
+    expect(saved.expires).toBeGreaterThan(Date.now() + 59 * DAY_S * 1000)
   })
 
   it("returns empty models when auth.json is absent", async () => {
@@ -753,10 +819,11 @@ describe("loadModels on cache miss", () => {
     expect(availableModelsCalls).toBe(0)
   })
 
-  it("returns empty models when oauth refresh is missing and token is expired", async () => {
+  it("returns empty models when Cursor ended the session, without persisting", async () => {
+    sessionResponse = () => Response.json({ access_token: "", id_token: "", shouldLogout: true })
     await writeAuth({
       type: "oauth",
-      access: fakeJwt(-60),
+      access: sessionJwt(61 * DAY_S),
       refresh: "",
       expires: Date.now() - 60_000,
     })
@@ -766,31 +833,20 @@ describe("loadModels on cache miss", () => {
     await plugin.config?.(config as never)
 
     expect(config.provider?.cursor?.models).toEqual({})
+    expect(refreshCalls).toBe(1)
     expect(availableModelsCalls).toBe(0)
-    expect(refreshCalls).toBe(0)
     expect(persisted).toHaveLength(0)
   })
 
-  it("returns empty models when refresh fails and does not persist half-state", async () => {
+  it("returns empty models when an expired session cannot be renewed and does not persist", async () => {
+    sessionResponse = () => new Response("nope", { status: 500 })
     await writeAuth({
       type: "oauth",
-      access: fakeJwt(-60),
+      access: sessionJwt(61 * DAY_S),
       refresh: "bad-refresh",
       expires: Date.now() - 60_000,
       enterpriseUrl: "https://enterprise.example",
     })
-
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes("/auth/token")) {
-        refreshCalls += 1
-        return new Response("nope", { status: 500 })
-      }
-      if (url.includes("cursor.com/install")) {
-        return new Response(INSTALLER_FIXTURE, { status: 200 })
-      }
-      throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
 
     const plugin = await CursorPlugin(pluginInput())
     const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
@@ -802,37 +858,78 @@ describe("loadModels on cache miss", () => {
     expect(persisted).toHaveLength(0)
   })
 
-  it("still uses refreshed oauth token when persistAuth fails", async () => {
-    await writeAuth({
-      type: "oauth",
-      access: fakeJwt(-60),
-      refresh: "old-refresh",
-      expires: Date.now() - 60_000,
-    })
+  it("keeps using a valid session through a transient renewal failure", async () => {
+    sessionResponse = () => new Response("down", { status: 503 })
+    const old = sessionJwt(16 * DAY_S)
+    await writeAuth({ type: "oauth", access: old, refresh: old, expires: Date.now() + 44 * DAY_S * 1000 })
 
-    const plugin = await CursorPlugin({
-      directory: projectDir,
-      client: {
-        auth: {
-          set: async () => {
-            throw new Error("auth.set failed")
-          },
-        },
-      },
-    } as never)
+    const plugin = await CursorPlugin(pluginInput())
+    const opts = await runLoader(plugin, async () => ({ type: "oauth", access: old, refresh: old, expires: 0 }))
+
+    expect(await opts.getAccessToken!()).toBe(old)
+    expect(refreshCalls).toBe(1) // the second call is inside the backoff
+    expect(persisted).toHaveLength(0)
+  })
+
+  it("still uses the renewed session when persisting fails", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    await writeAuth({ type: "oauth", access: old, refresh: old, expires: Date.now() + 44 * DAY_S * 1000 })
+
+    const plugin = await CursorPlugin(pluginInput({ failPersist: true }))
+    const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
+    await plugin.config?.(config as never)
+    expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
+
+    // getAuth still returns the old credential: the renewal is not repeated,
+    // and the failed write is not retried on every Run.
+    const opts = await runLoader(plugin, async () => ({ type: "oauth", access: old, refresh: old, expires: 0 }))
+    expect(await opts.getAccessToken!()).not.toBe(old)
+    await opts.getAccessToken!()
+    expect(refreshCalls).toBe(1)
+    expect(persistAttempts).toBe(1)
+  })
+
+  it("does not overwrite a credential that changed during renewal", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    const relogin = sessionJwt(0)
+    await writeAuth({ type: "oauth", access: old, refresh: old, expires: 0 })
+    sessionResponse = async () => {
+      // A re-login lands while the renewal request is in flight.
+      await writeAuth({ type: "oauth", access: relogin, refresh: relogin, expires: 0 })
+      return Response.json({ access_token: sessionJwt(0), shouldLogout: false })
+    }
+
+    const plugin = await CursorPlugin(pluginInput())
     const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
     await plugin.config?.(config as never)
 
-    expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
     expect(refreshCalls).toBe(1)
-    expect(availableModelsCalls).toBe(1)
+    expect(persisted).toHaveLength(0)
+  })
+
+  it("never uses an API key for a browser login, or a session renewal for an API key", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    await writeAuth({ type: "oauth", access: old, refresh: old, expires: 0 })
+    const plugin = await CursorPlugin(pluginInput())
+    const oauthOpts = await runLoader(plugin, async () => ({ type: "oauth", access: old, refresh: old, expires: 0 }))
+    expect(oauthOpts.apiKey).toBeUndefined()
+    expect(exchangeKeys).toEqual([])
+
+    resetAuthRenewalState()
+    refreshCalls = 0
+    const apiAuth = { type: "api", key: fakeJwt(-60), metadata: { apiKey: "crsr_k" } }
+    await writeAuth(apiAuth)
+    const apiOpts = await runLoader(plugin, async () => apiAuth)
+    expect(apiOpts.apiKey).toBeUndefined()
+    expect(refreshCalls).toBe(0)
+    expect(exchangeKeys).toEqual(["crsr_k"])
   })
 
   it("fetches and caches models when api auth exists and cache is empty", async () => {
     await writeAuth({
       type: "api",
       key: fakeJwt(3600),
-      metadata: { refreshToken: "api-refresh" },
+      metadata: { apiKey: "crsr_live" },
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -841,15 +938,15 @@ describe("loadModels on cache miss", () => {
 
     expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
     expect(availableModelsCalls).toBe(1)
-    expect(refreshCalls).toBe(0)
+    expect(exchangeKeys).toEqual([])
     expect((await readCache(cacheDir))?.models[0]?.id).toBe("fetched-model")
   })
 
-  it("refreshes expired api key via metadata.refreshToken, then fetches models", async () => {
+  it("re-exchanges the stored api key for an expired JWT and drops the unused refresh token", async () => {
     await writeAuth({
       type: "api",
       key: fakeJwt(-60),
-      metadata: { refreshToken: "api-refresh", note: "keep-me" },
+      metadata: { apiKey: "crsr_stored", refreshToken: "dead-refresh", note: "keep-me" },
     })
 
     const plugin = await CursorPlugin(pluginInput())
@@ -857,36 +954,155 @@ describe("loadModels on cache miss", () => {
     await plugin.config?.(config as never)
 
     expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
-    expect(refreshCalls).toBe(1)
-    expect(availableModelsCalls).toBe(1)
+    expect(exchangeKeys).toEqual(["crsr_stored"])
     expect(persisted).toHaveLength(1)
-    expect(persisted[0]).toMatchObject({
-      type: "api",
-      metadata: { refreshToken: "new-refresh", note: "keep-me" },
-    })
+    const saved = persisted[0] as { type: string; key: string; metadata: Record<string, string> }
+    expect(saved.type).toBe("api")
+    expect(isExpiringSoon(saved.key)).toBe(false)
+    expect(saved.metadata).toEqual({ apiKey: "crsr_stored", note: "keep-me" })
+  })
+
+  it("exchanges a raw api key the host stored as `key`", async () => {
+    await writeAuth({ type: "api", key: "crsr_raw-in-key" })
+
+    const plugin = await CursorPlugin(pluginInput())
+    const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
+    await plugin.config?.(config as never)
+
+    expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
+    expect(exchangeKeys).toEqual(["crsr_raw-in-key"])
+    expect(persisted).toHaveLength(1)
+    const saved = persisted[0] as { key: string; metadata: Record<string, string> }
+    expect(saved.key.startsWith("crsr_")).toBe(false)
+    expect(saved.metadata).toEqual({ apiKey: "crsr_raw-in-key" })
+  })
+
+  it("explains that an expired API-key login saved without the key needs a new sign-in", async () => {
+    const expired = fakeJwt(-60)
+    const stored = { type: "api", key: expired, metadata: { refreshToken: "dead-refresh" } }
+    await writeAuth(stored)
+
+    const plugin = await CursorPlugin(pluginInput())
+    const opts = await runLoader(plugin, async () => stored)
+
+    const error = await opts.getAccessToken!().catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(CursorAuthError)
+    expect((error as Error).message).toMatch(/saved without the key/)
+    expect(exchangeKeys).toEqual([])
+    expect(persisted).toHaveLength(0)
+  })
+
+  it("loader hands the provider a token function and no credential in options", async () => {
+    const live = fakeJwt(3600)
+    const stored = { type: "api" as const, key: live, metadata: { apiKey: "crsr_stored" } }
+    await writeAuth(stored)
+    const session = sessionJwt(DAY_S)
+    const oauth = { type: "oauth" as const, access: session, refresh: session, expires: 0 }
+
+    const plugin = await CursorPlugin(pluginInput())
+    for (const [credential, token] of [[stored, live], [oauth, session]] as const) {
+      const opts = await runLoader(plugin, async () => credential)
+      expect(Object.keys(opts).sort()).toEqual(["cacheDir", "getAccessToken", "workspaceRoot"])
+      expect(await opts.getAccessToken!()).toBe(token)
+      // OpenCode serves provider options through JSON (`toPublicInfo`), as it
+      // does for its own OAuth providers' `fetch`: functions drop out.
+      const serialized = JSON.stringify(opts)
+      expect(serialized).not.toContain("crsr_")
+      expect(serialized).not.toContain(token)
+      expect(serialized).not.toContain("getAccessToken")
+    }
+  })
+
+  it("getAccessToken follows a re-login without a restart", async () => {
+    const first = sessionJwt(DAY_S)
+    let current: unknown = { type: "oauth", access: first, refresh: first, expires: 0 }
+    await writeAuth(current)
+    const plugin = await CursorPlugin(pluginInput())
+    const opts = await runLoader(plugin, async () => current)
+    expect(await opts.getAccessToken!()).toBe(first)
+
+    const second = sessionJwt(0)
+    current = { type: "oauth", access: second, refresh: second, expires: 0 }
+    expect(await opts.getAccessToken!()).toBe(second)
+  })
+
+  it("getAccessToken force-renews a session Cursor rejected", async () => {
+    const live = sessionJwt(DAY_S)
+    const stored = { type: "oauth", access: live, refresh: live, expires: 0 }
+    await writeAuth(stored)
+    const plugin = await CursorPlugin(pluginInput())
+    const opts = await runLoader(plugin, async () => stored)
+    expect(refreshCalls).toBe(0)
+
+    const renewed = await opts.getAccessToken!({ forceRefresh: true })
+    expect(renewed).not.toBe(live)
+    expect(refreshCalls).toBe(1)
+  })
+
+  it("renews a session on demand once it becomes due, with no timer", async () => {
+    const live = sessionJwt(DAY_S)
+    let current: unknown = { type: "oauth", access: live, refresh: live, expires: 0 }
+    await writeAuth(current)
+    const plugin = await CursorPlugin(pluginInput())
+
+    const delays: number[] = []
+    const realSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+      delays.push(delay ?? 0)
+      return realSetTimeout(callback, delay)
+    }) as typeof setTimeout
+    let opts: LoaderOptions
+    try {
+      opts = await runLoader(plugin, async () => current)
+    } finally {
+      globalThis.setTimeout = realSetTimeout
+    }
+    // Like OpenCode's own OAuth providers: nothing is scheduled ahead.
+    expect(delays.filter((delay) => delay > 60_000)).toEqual([])
+    expect(refreshCalls).toBe(0)
+
+    // A re-login lands, then a week passes: the next Run's token request
+    // renews the credential it reads now, not the one seen at load time.
+    const relogin = sessionJwt(0)
+    current = { type: "oauth", access: relogin, refresh: relogin, expires: 0 }
+    await writeAuth(current)
+    setSystemTime(new Date(Date.now() + 8 * DAY_S * 1000))
+    try {
+      const token = await opts.getAccessToken!()
+      expect(refreshCalls).toBe(1)
+      expect(token).not.toBe(relogin)
+      expect(persisted).toHaveLength(1)
+      const saved = persisted[0] as { access: string; refresh: string }
+      expect(saved.access).toBe(token)
+      expect(saved.refresh).toBe(token)
+    } finally {
+      setSystemTime()
+    }
+  })
+
+  it("api key login stores only the raw key next to the exchanged JWT", async () => {
+    const plugin = await CursorPlugin(pluginInput())
+    const method = plugin.auth?.methods.find((m) => m.type === "api")
+    if (!method || method.type !== "api" || !method.authorize) throw new Error("missing api method")
+
+    const result = await method.authorize({ apiKey: "crsr_login" })
+
+    expect(result.type).toBe("success")
+    if (result.type !== "success") return
+    expect(isExpiringSoon(result.key)).toBe(false)
+    expect(result.metadata).toEqual({ apiKey: "crsr_login" })
   })
 
   it("loader skips discoverModels when config already wrote a fresh cache", async () => {
-    await writeAuth({
-      type: "oauth",
-      access: fakeJwt(3600),
-      refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
-    })
+    const live = sessionJwt(DAY_S)
+    await writeAuth({ type: "oauth", access: live, refresh: "refresh-tok", expires: 0 })
 
     const plugin = await CursorPlugin(pluginInput())
     const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
     await plugin.config?.(config as never)
     expect(availableModelsCalls).toBe(1)
 
-    const auth = plugin.auth
-    if (!auth || !("loader" in auth) || !auth.loader) throw new Error("missing loader")
-    await auth.loader(async () => ({
-      type: "oauth",
-      access: fakeJwt(3600),
-      refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
-    }), {} as never)
+    await runLoader(plugin, async () => ({ type: "oauth", access: live, refresh: "refresh-tok", expires: 0 }))
 
     // Fresh cache from config — no second AvailableModels (and no background kick).
     expect(availableModelsCalls).toBe(1)
@@ -896,94 +1112,16 @@ describe("loadModels on cache miss", () => {
 
   it("loader honors CURSOR_GET_SERVER_CONFIG_TELEMETRY for agent-url warmup", async () => {
     process.env.CURSOR_GET_SERVER_CONFIG_TELEMETRY = "1"
-    await writeAuth({
-      type: "oauth",
-      access: fakeJwt(3600),
-      refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
-    })
+    const live = sessionJwt(DAY_S)
+    await writeAuth({ type: "oauth", access: live, refresh: "refresh-tok", expires: 0 })
 
     const plugin = await CursorPlugin(pluginInput())
     const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
     await plugin.config?.(config as never)
 
-    const auth = plugin.auth
-    if (!auth || !("loader" in auth) || !auth.loader) throw new Error("missing loader")
-    await auth.loader(async () => ({
-      type: "oauth",
-      access: fakeJwt(3600),
-      refresh: "refresh-tok",
-      expires: Date.now() + 3_600_000,
-    }), {} as never)
+    await runLoader(plugin, async () => ({ type: "oauth", access: live, refresh: "refresh-tok", expires: 0 }))
 
     expect(serverConfigCalls).toBe(1)
     expect(JSON.parse(serverConfigBodies[0])).toEqual({ telem_enabled: true })
-  })
-
-  it("loader falls back to session token when getAuth refresh fails after config already refreshed", async () => {
-    await writeAuth({
-      type: "oauth",
-      access: fakeJwt(-60),
-      refresh: "one-shot-refresh",
-      expires: Date.now() - 60_000,
-    })
-
-    let refreshPhase = 0
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input)
-      if (url.includes("/auth/token")) {
-        refreshCalls += 1
-        refreshPhase += 1
-        if (refreshPhase === 1) {
-          return Response.json({
-            accessToken: fakeJwt(3600),
-            refreshToken: "new-refresh",
-          })
-        }
-        return new Response("reuse denied", { status: 401 })
-      }
-      if (url.includes("AvailableModels")) {
-        availableModelsCalls += 1
-        return Response.json({
-          models: [{ name: "fetched-model", clientDisplayName: "Fetched" }],
-        })
-      }
-      if (url.includes("GetServerConfig")) {
-        return Response.json({
-          agentUrlConfig: { agentnUrl: "https://agentn.us.api5.cursor.sh" },
-        })
-      }
-      if (url.includes("cursor.com/install")) {
-        return new Response(INSTALLER_FIXTURE, { status: 200 })
-      }
-      throw new Error(`unexpected fetch: ${url}`)
-    }) as typeof fetch
-
-    const plugin = await CursorPlugin({
-      directory: projectDir,
-      client: {
-        auth: {
-          set: async () => {
-            throw new Error("auth.set failed")
-          },
-        },
-      },
-    } as never)
-    const config: { provider?: Record<string, { models?: Record<string, unknown> }> } = {}
-    await plugin.config?.(config as never)
-    expect(config.provider?.cursor?.models).toHaveProperty("fetched-model")
-
-    const auth = plugin.auth
-    if (!auth || !("loader" in auth) || !auth.loader) throw new Error("missing loader")
-    // getAuth still returns pre-refresh credentials; second refresh fails.
-    const opts = await auth.loader(async () => ({
-      type: "oauth",
-      access: fakeJwt(-60),
-      refresh: "one-shot-refresh",
-      expires: Date.now() - 60_000,
-    }), {} as never)
-
-    expect(opts.accessToken).toBeDefined()
-    expect(availableModelsCalls).toBe(1)
   })
 })

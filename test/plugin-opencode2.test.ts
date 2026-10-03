@@ -5,7 +5,15 @@ import { join, resolve } from "node:path"
 import plugin from "../src/plugin-opencode2.js"
 import { CursorPlugin } from "../src/plugin.js"
 import { applyCursorProviderInventory, CURSOR_AISDK_PACKAGE } from "../src/opencode2/catalog.js"
-import { applyCursorIntegration, accessTokenFromCredential } from "../src/opencode2/integration.js"
+import {
+  accessTokenFromCredential,
+  applyCursorIntegration,
+  refreshOAuth,
+  requireCursorAccessToken,
+} from "../src/opencode2/integration.js"
+import { resetAuthRenewalState } from "../src/auth-renewal.js"
+import { decodeJwtExpiryMs } from "../src/auth.js"
+import { CursorAuthError } from "../src/errors.js"
 import { clearCompactionSessions, isCompactionSession, markCompactionSession } from "../src/compaction-marker.js"
 import {
   clearSessionDirectories,
@@ -43,6 +51,37 @@ import type {
   ProviderInfo,
 } from "../src/opencode2/types.js"
 import type { ModelInfo } from "../src/models.js"
+
+const DAY_S = 86_400
+
+/** Cursor browser-login session JWT: 60-day life, issue time in `time`. */
+function sessionJwt(issuedAgoSec: number): string {
+  const issued = Math.floor(Date.now() / 1000) - issuedAgoSec
+  const payload = Buffer.from(JSON.stringify({
+    type: "session",
+    time: String(issued),
+    exp: issued + 60 * DAY_S,
+    randomness: Math.random().toString(36),
+  })).toString("base64url")
+  return `h.${payload}.s`
+}
+
+function jwtExpiringIn(seconds: number): string {
+  const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + seconds, n: Math.random() }))
+    .toString("base64url")
+  return `h.${payload}.s`
+}
+
+/** Run `body` with `fetch` answered by `respond`. */
+async function withFetch<T>(respond: (url: string) => Response, body: () => Promise<T>): Promise<T> {
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL) => respond(String(input))) as typeof fetch
+  try {
+    return await body()
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
 
 // ── Fake provider editor ──
 
@@ -317,6 +356,8 @@ function fakeIntegrationDraft() {
 }
 
 describe("opencode2 integration", () => {
+  beforeEach(() => resetAuthRenewalState())
+
   test("registers oauth, key, and env connection methods", () => {
     const { draft, refs, methods } = fakeIntegrationDraft()
     applyCursorIntegration(draft)
@@ -347,19 +388,10 @@ describe("opencode2 integration", () => {
     expect((env!.method as any).names).toContain("CURSOR_API_KEY")
   })
 
-  test("a non-expiring oauth credential is used as-is", async () => {
-    // exp far in the future
-    const payload = Buffer.from(
-      JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 }),
-    ).toString("base64url")
-    const jwt = `h.${payload}.s`
-    const token = await accessTokenFromCredential({
-      type: "oauth",
-      methodID: "oauth",
-      access: jwt,
-      refresh: "r",
-      expires: Date.now() + 86_400_000,
-    })
+  test("a session credential that is not due is used as-is, without a request", async () => {
+    const jwt = sessionJwt(DAY_S)
+    const token = await withFetch(() => { throw new Error("no request expected") }, () =>
+      accessTokenFromCredential({ type: "oauth", methodID: "oauth", access: jwt, refresh: jwt, expires: 0 }))
     expect(token).toBe(jwt)
   })
 
@@ -369,8 +401,88 @@ describe("opencode2 integration", () => {
     expect(token).toBe("already.a.jwt")
   })
 
-  test("a missing credential yields no token", async () => {
-    expect(await accessTokenFromCredential(undefined)).toBeUndefined()
+  test("a raw key credential is exchanged once and cached", async () => {
+    let exchanges = 0
+    const exchanged = jwtExpiringIn(3600)
+    const fetchStub = (url: string) => {
+      if (!url.includes("/auth/exchange_user_api_key")) throw new Error(`unexpected ${url}`)
+      exchanges++
+      return Response.json({ accessToken: exchanged, refreshToken: "unused" })
+    }
+    const first = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_oc2" }))
+    const second = await withFetch(fetchStub, () => accessTokenFromCredential({ type: "key", key: "crsr_oc2" }))
+    expect([first, second]).toEqual([exchanged, exchanged])
+    expect(exchanges).toBe(1)
+  })
+
+  test("a missing credential raises a sign-in error", async () => {
+    const error = await accessTokenFromCredential(undefined).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(CursorAuthError)
+  })
+
+  test("refresh renews through /oauth/token and stores the JWT expiry as expires", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    const fresh = sessionJwt(0)
+    const paths: string[] = []
+    const renewed = await withFetch((url) => {
+      paths.push(new URL(url).pathname)
+      return Response.json({ access_token: fresh, id_token: "id", shouldLogout: false })
+    }, () => refreshOAuth({ type: "oauth", methodID: "oauth", access: old, refresh: old, expires: 0, metadata: { a: 1 } }))
+    expect(paths).toEqual(["/oauth/token"])
+    expect(renewed).toEqual({
+      type: "oauth",
+      methodID: "oauth",
+      access: fresh,
+      refresh: fresh,
+      expires: decodeJwtExpiryMs(fresh)!,
+      metadata: { a: 1 },
+    })
+  })
+
+  test("refresh keeps a valid session through a transient failure and asks again later", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    const credential = { type: "oauth" as const, methodID: "oauth", access: old, refresh: old, expires: 0 }
+    const result = await withFetch(() => new Response("down", { status: 503 }), () => refreshOAuth(credential))
+    expect(result.access).toBe(old)
+    expect(result.expires).toBeGreaterThan(Date.now())
+    expect(result.expires).toBeLessThan(Date.now() + 60 * 60_000)
+  })
+
+  test("refresh throws when Cursor ended the session", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    const error = await withFetch(
+      () => Response.json({ access_token: "", id_token: "", shouldLogout: true }),
+      () => refreshOAuth({ type: "oauth", methodID: "oauth", access: old, refresh: old, expires: 0 }),
+    ).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(CursorAuthError)
+  })
+
+  test("refresh hands the host a session this process already renewed in memory", async () => {
+    const old = sessionJwt(16 * DAY_S)
+    const fresh = sessionJwt(0)
+    let requests = 0
+    const stub = () => {
+      requests++
+      return Response.json({ access_token: fresh, shouldLogout: false })
+    }
+    const legacy = { type: "oauth" as const, methodID: "oauth", access: old, refresh: old, expires: Date.now() + 44 * DAY_S * 1000 }
+    expect(await withFetch(stub, () => accessTokenFromCredential(legacy))).toBe(fresh)
+    const handed = await withFetch(stub, () => refreshOAuth(legacy))
+    expect(handed.access).toBe(fresh)
+    expect(requests).toBe(1)
+  })
+
+  test("requireCursorAccessToken keeps a classified host error and wraps others", async () => {
+    const domain = (resolve: () => Promise<any>) => ({
+      transform: async () => ({ dispose: async () => {} }),
+      reload: async () => {},
+      connection: { active: async () => ({ type: "credential", id: "c", label: "l" }), resolve },
+    }) as any
+    const classified = new CursorAuthError("ended", { code: "session_logout" })
+    expect(await requireCursorAccessToken(domain(async () => { throw classified })).catch((e: unknown) => e)).toBe(classified)
+    const wrapped = await requireCursorAccessToken(domain(async () => { throw new Error("db down") })).catch((e: unknown) => e)
+    expect(wrapped).toBeInstanceOf(CursorAuthError)
+    expect((wrapped as Error).message).toContain("db down")
   })
 })
 
@@ -802,6 +914,27 @@ describe("opencode2 setup", () => {
       rmSync(configDir, { recursive: true, force: true })
       rmSync(cacheDir, { recursive: true, force: true })
     }
+  })
+
+  test("the aisdk sdk hook resolves the token per Run, not when the SDK is built", async () => {
+    const { ctx, hooks } = fakeContext()
+    let resolves = 0
+    ctx.integration.connection = {
+      active: async () => ({ type: "credential", id: "c", label: "Cursor" }),
+      resolve: async () => {
+        resolves++
+        return { type: "key", key: "already.a.jwt" }
+      },
+    }
+    const cleanup = await plugin.setup(ctx)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const before = resolves
+    const event: any = { model: { providerID: "cursor", id: "m", modelID: "m" }, package: CURSOR_AISDK_PACKAGE, options: {} }
+    await hooks.get("aisdk.sdk")!(event)
+    expect(typeof event.sdk?.languageModel).toBe("function")
+    expect(resolves).toBe(before)
+    expect(typeof cleanup).toBe("function")
+    if (typeof cleanup === "function") await cleanup()
   })
 
   test("the aisdk language hook resolves the wire model id", async () => {

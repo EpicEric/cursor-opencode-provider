@@ -4,11 +4,8 @@ import {
   decodeJwtPayload,
   decodeJwtExpiryMs,
   exchangeApiKey,
-  refreshAccessToken,
-  resolveBearerToken,
-  clearBearerTokenCache,
+  refreshCursorSession,
   AuthExchangeError,
-  AuthRefreshError,
   generatePkceParams,
   generatePkceChallenge,
   buildLoginUrl,
@@ -17,6 +14,7 @@ import {
   AuthTimeoutError,
 } from "../src/auth.js"
 import { obfuscate, createCursorChecksumHeader } from "../src/protocol/checksum.js"
+import { CURSOR_OAUTH_CLIENT_ID } from "../src/shared.js"
 
 // ── JWT expiry ──
 
@@ -154,154 +152,86 @@ describe("exchangeApiKey", () => {
     expect(result.accessToken).toBe("access.jwt")
     expect(result.refreshToken).toBe("refresh.jwt")
   })
-})
 
-// ── Token refresh (mocked) ──
+  // Classification mirrors Cursor CLI `loginWithApiKey`.
+  async function exchangeFailure(response: () => Response): Promise<AuthExchangeError> {
+    using server = Bun.serve({ port: 0, fetch: response })
+    const error = await exchangeApiKey("crsr_x", `http://localhost:${server.port}`).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(AuthExchangeError)
+    return error as AuthExchangeError
+  }
 
-describe("refreshAccessToken", () => {
-  it("throws AuthRefreshError on non-200", async () => {
-    using server = Bun.serve({
-      port: 0,
-      fetch(req) {
-        return new Response("Unauthorized", { status: 401 })
-      },
-    })
-    await expect(
-      refreshAccessToken("refresh.jwt", `http://localhost:${server.port}`),
-    ).rejects.toThrow(AuthRefreshError)
+  it("classifies a 403 sign_in_policy_violation as a policy block", async () => {
+    const error = await exchangeFailure(() => Response.json({ error: "sign_in_policy_violation" }, { status: 403 }))
+    expect(error.kind).toBe("policy")
+    expect(error.status).toBe(403)
   })
 
-  it("returns tokens on success", async () => {
+  it("classifies 401 and other 403 responses as a rejected key", async () => {
+    expect((await exchangeFailure(() => new Response("no", { status: 401 }))).kind).toBe("rejected")
+    expect((await exchangeFailure(() => Response.json({ error: "other" }, { status: 403 }))).kind).toBe("rejected")
+  })
+
+  it("classifies rate limits, timeouts, 5xx and network failures as transient", async () => {
+    expect((await exchangeFailure(() => new Response("slow down", { status: 429 }))).kind).toBe("transient")
+    expect((await exchangeFailure(() => new Response("timeout", { status: 408 }))).kind).toBe("transient")
+    expect((await exchangeFailure(() => new Response("down", { status: 503 }))).kind).toBe("transient")
+    const network = await exchangeApiKey("crsr_x", "http://127.0.0.1:1").catch((e: unknown) => e)
+    expect((network as AuthExchangeError).kind).toBe("transient")
+  })
+})
+
+// ── Browser-login session refresh (mocked) ──
+
+describe("refreshCursorSession", () => {
+  it("posts the Cursor IDE refresh grant to /oauth/token", async () => {
+    let seen: { path: string; headers: Headers; body: Record<string, unknown> } | undefined
     using server = Bun.serve({
       port: 0,
       async fetch(req) {
-        const body = await req.json()
-        expect(body.refreshToken).toBe("refresh.jwt")
-        return Response.json({
-          accessToken: "new-access.jwt",
-          refreshToken: "new-refresh.jwt",
-        })
+        seen = { path: new URL(req.url).pathname, headers: req.headers, body: await req.json() }
+        return Response.json({ access_token: "new.session.jwt", id_token: "id.jwt", shouldLogout: false })
       },
     })
-    const result = await refreshAccessToken(
-      "refresh.jwt",
-      `http://localhost:${server.port}`,
-    )
-    expect(result.accessToken).toBe("new-access.jwt")
-    expect(result.refreshToken).toBe("new-refresh.jwt")
+    const result = await refreshCursorSession("old.session.jwt", `http://localhost:${server.port}`)
+    expect(result).toEqual({ ok: true, accessToken: "new.session.jwt" })
+    expect(seen?.path).toBe("/oauth/token")
+    expect(seen?.headers.get("content-type")).toBe("application/json")
+    expect(seen?.headers.get("x-cursor-client-type")).toBe("cli")
+    expect(seen?.body).toEqual({
+      grant_type: "refresh_token",
+      client_id: CURSOR_OAUTH_CLIENT_ID,
+      refresh_token: "old.session.jwt",
+    })
+  })
+
+  it("reads a rejected session from the 200 body (shouldLogout)", async () => {
+    using server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ access_token: "", id_token: "", shouldLogout: true }),
+    })
+    const result = await refreshCursorSession("dead", `http://localhost:${server.port}`)
+    expect(result).toMatchObject({ ok: false, kind: "logout", status: 200 })
+  })
+
+  it("reports a sign-in policy block separately", async () => {
+    using server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({ access_token: "", shouldLogout: true, error: "sign_in_policy_violation" }),
+    })
+    const result = await refreshCursorSession("blocked", `http://localhost:${server.port}`)
+    expect(result).toMatchObject({ ok: false, kind: "policy" })
+  })
+
+  it("treats an empty token, 5xx, and network failures as transient", async () => {
+    using empty = Bun.serve({ port: 0, fetch: () => Response.json({ access_token: "", shouldLogout: false }) })
+    expect(await refreshCursorSession("t", `http://localhost:${empty.port}`)).toMatchObject({ ok: false, kind: "transient" })
+    using down = Bun.serve({ port: 0, fetch: () => new Response("down", { status: 502 }) })
+    expect(await refreshCursorSession("t", `http://localhost:${down.port}`)).toMatchObject({ ok: false, kind: "transient", status: 502 })
+    expect(await refreshCursorSession("t", "http://127.0.0.1:1")).toMatchObject({ ok: false, kind: "transient" })
   })
 })
 
-describe("resolveBearerToken", () => {
-  it("returns accessToken as-is when provided", async () => {
-    clearBearerTokenCache()
-    const token = await resolveBearerToken({ accessToken: "jwt-direct" })
-    expect(token).toBe("jwt-direct")
-  })
-
-  it("throws when neither accessToken nor apiKey is provided", async () => {
-    clearBearerTokenCache()
-    await expect(resolveBearerToken({})).rejects.toThrow(/no access token or API key/)
-  })
-
-  it("exchanges apiKey once and reuses the cached JWT", async () => {
-    clearBearerTokenCache()
-    let exchanges = 0
-    using server = Bun.serve({
-      port: 0,
-      fetch() {
-        exchanges++
-        return Response.json({
-          accessToken: makeJwt(3600),
-          refreshToken: "refresh.jwt",
-        })
-      },
-    })
-    const base = `http://localhost:${server.port}`
-    const a = await resolveBearerToken({ apiKey: "crsr_cache-test", baseUrl: base })
-    const b = await resolveBearerToken({ apiKey: "crsr_cache-test", baseUrl: base })
-    expect(a).toBe(b)
-    expect(exchanges).toBe(1)
-  })
-
-  it("refreshes a near-expiry cached JWT instead of re-exchanging", async () => {
-    clearBearerTokenCache()
-    let exchanges = 0
-    let refreshes = 0
-    using server = Bun.serve({
-      port: 0,
-      fetch(req) {
-        const url = new URL(req.url)
-        if (url.pathname.endsWith("/auth/exchange_user_api_key")) {
-          exchanges++
-          return Response.json({
-            accessToken: makeJwt(60),
-            refreshToken: "refresh.jwt",
-          })
-        }
-        if (url.pathname.endsWith("/auth/token")) {
-          refreshes++
-          return Response.json({
-            accessToken: makeJwt(3600),
-            refreshToken: "refresh.jwt.2",
-          })
-        }
-        return new Response("not found", { status: 404 })
-      },
-    })
-    const base = `http://localhost:${server.port}`
-    await resolveBearerToken({ apiKey: "crsr_refresh-test", baseUrl: base })
-    const second = await resolveBearerToken({ apiKey: "crsr_refresh-test", baseUrl: base })
-    expect(exchanges).toBe(1)
-    expect(refreshes).toBe(1)
-    expect(isExpiringSoon(second)).toBe(false)
-  })
-
-  it("coalesces concurrent apiKey exchanges for the same key", async () => {
-    clearBearerTokenCache()
-    let exchanges = 0
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    using server = Bun.serve({
-      port: 0,
-      async fetch() {
-        exchanges++
-        await gate
-        return Response.json({
-          accessToken: makeJwt(3600),
-          refreshToken: "refresh.jwt",
-        })
-      },
-    })
-    const base = `http://localhost:${server.port}`
-    const first = resolveBearerToken({ apiKey: "crsr_inflight-test", baseUrl: base })
-    const second = resolveBearerToken({ apiKey: "crsr_inflight-test", baseUrl: base })
-    release()
-    const [a, b] = await Promise.all([first, second])
-    expect(a).toBe(b)
-    expect(exchanges).toBe(1)
-  })
-
-  it("uses a non-`crsr_` apiKey as-is without exchanging it", async () => {
-    clearBearerTokenCache()
-    let exchanges = 0
-    using server = Bun.serve({
-      port: 0,
-      fetch() {
-        exchanges++
-        return Response.json({ accessToken: makeJwt(3600), refreshToken: "refresh.jwt" })
-      },
-    })
-    const token = await resolveBearerToken({
-      apiKey: "already.a.jwt",
-      baseUrl: `http://localhost:${server.port}`,
-    })
-    expect(token).toBe("already.a.jwt")
-    expect(exchanges).toBe(0)
-  })
-})
 
 // ── PKCE ──
 

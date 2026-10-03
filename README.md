@@ -132,7 +132,7 @@ The provider never detects or names fork hosts. Compatibility layers own host id
 | Model, version, and 24-hour conversation **cache** | `~/.cache/opencode/` | A host bridge may replace the root |
 | Cursor **project metadata** (`agent-tools`, terminals, …) | `~/.cache/opencode/projects/<slug>/` | under `<host-cache>/projects/` |
 | OpenCode **auth** (`auth.json`) | `~/.local/share/opencode/` | `$XDG_DATA_HOME/opencode/` when set |
-| OpenCode **config** (AGENTS, skills, …) | `~/.config/opencode/` | still OpenCode-named for rule discovery |
+| OpenCode **config** (AGENTS, skills, …) | `~/.config/opencode/` | `$XDG_CONFIG_HOME/opencode/` when set, as OpenCode resolves it |
 
 ### Select a model
 
@@ -220,7 +220,7 @@ const model = cursor.languageModel("composer-2.5")
 // model implements AI SDK LanguageModelV3 (doStream / doGenerate)
 ```
 
-Pass either `accessToken` (JWT from OAuth or key exchange) or `apiKey` (raw `crsr_...` key). Optional: `apiBaseURL`, `agentBaseURL`, `cacheDir`, `headers`, `telemetryEnabled`, `retry`, and `continuation`. `cacheDir` pins the host cache root for model/version caches and Cursor project metadata; when omitted, the provider uses an injected structural host path bridge or the native OpenCode XDG cache described in [Paths](#paths-host-cache). Transient failures resume from the latest checkpoint produced by that Run, matching Cursor CLI; without an eligible checkpoint, retries remain limited to replay-safe attempts so completed text or tool work is not duplicated. Once that budget is spent, or replay is unsafe, the terminal error does not re-arm OpenCode's outer retry loop. Pending-tool inactivity is renewed by OpenCode activity from the session or its descendants. The older `baseURL` option is still accepted as a legacy alias for `agentBaseURL`.
+Give one credential source. The provider uses the first present and never falls back from one to another: `getAccessToken` (an async function returning the current access token, called for every Run so a long-running process can renew its login; it receives `{ forceRefresh: true }` once after Cursor rejects a token), then `accessToken` (a JWT sent as-is, never renewed), then `apiKey` (a raw `crsr_...` key, exchanged for a JWT and exchanged again near its expiry, the way Cursor CLI renews an API-key login). Optional: `apiBaseURL`, `agentBaseURL`, `cacheDir`, `headers`, `telemetryEnabled`, `retry`, and `continuation`. `cacheDir` pins the host cache root for model/version caches and Cursor project metadata; when omitted, the provider uses an injected structural host path bridge or the native OpenCode XDG cache described in [Paths](#paths-host-cache). Transient failures resume from the latest checkpoint produced by that Run, matching Cursor CLI; without an eligible checkpoint, retries remain limited to replay-safe attempts so completed text or tool work is not duplicated. Once that budget is spent, or replay is unsafe, the terminal error does not re-arm OpenCode's outer retry loop. Pending-tool inactivity is renewed by OpenCode activity from the session or its descendants. The older `baseURL` option is still accepted as a legacy alias for `agentBaseURL`.
 
 ## Environment variables
 
@@ -268,7 +268,7 @@ OpenCode
 
 | Module | Role |
 |--------|------|
-| `src/plugin.ts` | Classic OpenCode hooks: provider registration, OAuth, API key exchange, token refresh |
+| `src/plugin.ts` | Classic OpenCode hooks: provider registration, OAuth, API key exchange, login renewal and persistence |
 | `src/plugin-v2.ts` | OpenCode 1.18 Effect/Promise v2 plugin (`ctx.aisdk.*`); load via `./plugin/v2` only |
 | `src/plugin-opencode2.ts` | OpenCode 2.0 plugin (`provider.transform`, integration, tools, aisdk, `shell.create.before`, `websearch`, plan kickoff); load via `./plugin/opencode2` or `./server` |
 | `src/opencode2/` | 2.0-only provider inventory, integration/auth, and local API types |
@@ -280,7 +280,8 @@ OpenCode
 | `src/language-model.ts` | AI SDK `LanguageModelV3` adapter (`doStream`, `doGenerate`) |
 | `src/session.ts` | Held-open agent Run session and pending exec correlation |
 | `src/debug.ts` | Opt-in wire-level debug logging (`CURSOR_PROVIDER_DEBUG`) |
-| `src/auth.ts` | PKCE OAuth, API key exchange, JWT refresh |
+| `src/auth.ts` | PKCE OAuth, API key exchange, browser-login session refresh (`/oauth/token`) |
+| `src/auth-renewal.ts` | Credential renewal policy: session and API-key renewal kept separate, backoff, on-demand renewal, Bearer resolution |
 | `src/models.ts` | `AvailableModels` fetch and `cursor-models.json` cache |
 | `src/protocol/conversation-persistence.ts` | Atomic per-session restart snapshots under the 24-hour `cursor-conversations/` cache |
 | `src/context/paths.ts` | Host cache root + Cursor project metadata under `<host-cache>/projects/<slug>/` |
@@ -346,7 +347,7 @@ The package root intentionally stays plugin-safe for OpenCode's classic loader. 
 |---------|-------------|
 | No Cursor models in the picker (OpenCode 1.x) | Confirm Cursor auth (`opencode auth login` → **cursor**). Restart OpenCode — if auth is present and the cache is empty, models are fetched on startup. Confirm `provider.cursor.npm` is the package name (or a built `file://…/dist/index.js`). See [OpenCode 1.x troubleshooting](docs/opencode-1.md#troubleshooting). |
 | No Cursor models in the picker (`opencode2`) | Confirm `/connect` → **Cursor** (or shared `auth.json`). Use a dedicated `OPENCODE_CONFIG_DIR` (not mixed with 1.x). Ensure `$OPENCODE_CONFIG_DIR/plugins/cursor/` is a package directory re-exporting `plugin/opencode2` (not a bare `.js`). After auth, Cursor models appear in the picker from the in-memory inventory — no `opencode.json` model list is required. Filter by provider **Cursor** (`time.released` is `0`, so models sort last). Leftover `providers.cursor` fights that inventory — [safe transition](docs/opencode-2.md#safe-transition). |
-| Auth / 401 errors mid-session | Re-login. OAuth and exchanged API-key JWTs refresh automatically when near expiry; a revoked refresh token needs a fresh login. |
+| Auth / 401 errors mid-session | Logins renew themselves: a browser login (60-day session) is renewed through Cursor's `/oauth/token` once less than 1272 h of it remain, as Cursor's IDE decides, whenever a request needs a token (there is no background timer, as with OpenCode's own OAuth providers); an API-key login exchanges its stored key again within five minutes of the exchanged JWT's expiry, as Cursor CLI does. The two never stand in for each other. Sign in again when the error says the session was ended, the key was rejected, or a sign-in policy blocks it. An API-key login saved before the key was kept (`metadata.apiKey`) cannot be renewed and needs one fresh API-key sign-in. Renewal attempts and failures go to the debug log (`CURSOR_PROVIDER_DEBUG`). |
 | Local OpenCode 2.0 still runs the published package | Set `CURSOR_OPENCODE2_DEV_ENTRY` to an absolute `…/dist/index.js` path **before** starting the daemon, persist it with `opencode2 service set env CURSOR_OPENCODE2_DEV_ENTRY …`, rebuild (`bun run build`), then `opencode2 service restart`. Loading only `dist/plugin-opencode2.js` is not enough — without the env var, 2.0 still `npm install`s the published package into the host cache. |
 | “Too many connections from different devices” | Device IDs are derived from stable OS identifiers (same approach as the Cursor CLI). Avoid running multiple clients that invent different machine fingerprints for the same account. |
 | Empty or stale model list | Delete `<host-cache>/cursor-models.json` (native default `~/.cache/opencode/`) and restart OpenCode. A compatibility layer may supply a different host-cache root through the structural path bridge. Existing Cursor auth is enough to refill the cache; re-login only if auth itself is broken. Cache TTL is 24h; a failed background refresh keeps serving the previous cache. |

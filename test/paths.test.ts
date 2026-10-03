@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test"
-import { existsSync, mkdirSync, rmSync } from "node:fs"
+import { existsSync, rmSync } from "node:fs"
 import path from "node:path"
 import {
   ensureOpencodeProjectDir,
@@ -94,9 +94,21 @@ describe("resolveHostCacheDir", () => {
 })
 
 describe("opencodeGlobalConfigDir", () => {
-  it("stays under $HOME/.config/opencode", () => {
+  it("defaults to $HOME/.config/opencode", () => {
     process.env.HOME = "/tmp/fake-home"
+    delete process.env.XDG_CONFIG_HOME
     expect(opencodeGlobalConfigDir()).toBe(path.join("/tmp/fake-home", ".config", "opencode"))
+  })
+
+  it("uses $XDG_CONFIG_HOME/opencode when set, as OpenCode does", () => {
+    process.env.HOME = "/tmp/fake-home"
+    process.env.XDG_CONFIG_HOME = "/tmp/xdg-config"
+    expect(opencodeGlobalConfigDir()).toBe(path.join("/tmp/xdg-config", "opencode"))
+  })
+
+  it("ignores an empty XDG_CONFIG_HOME", () => {
+    expect(opencodeGlobalConfigDir({ HOME: "/tmp/fake-home", XDG_CONFIG_HOME: "" }))
+      .toBe(path.join("/tmp/fake-home", ".config", "opencode"))
   })
 })
 

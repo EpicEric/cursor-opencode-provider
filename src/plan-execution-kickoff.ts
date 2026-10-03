@@ -12,7 +12,7 @@
 
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { trace } from "./debug.js"
+import { errorMessage, trace } from "./debug.js"
 
 export type PlanExecutionKickoffInput = {
   sessionID: string
@@ -188,7 +188,7 @@ export async function flushPlanExecutionKickoff(
     trace(`plan-execution-kickoff: queued sessionID=${key} planPath=${state.planPath}`)
     return true
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
+    const detail = errorMessage(error)
     const message =
       `The approved plan could not start execution: ${detail}. ` +
       "The plan remains active and can be retried."

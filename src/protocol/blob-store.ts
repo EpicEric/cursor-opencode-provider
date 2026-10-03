@@ -10,6 +10,7 @@
  * latest checkpoint, matching Cursor CLI's conversation-export traversal.
  */
 
+import { errorMessage } from "../debug.js"
 import { collectReachableConversationBlobIds } from "./blob-reachability.js"
 
 function hex(b: Uint8Array): string {
@@ -111,7 +112,7 @@ export function inspectConversationBlobGraph(
     }
     return { count, bytes, complete: true }
   } catch (error) {
-    return retainedStats(error instanceof Error ? error.message : String(error))
+    return retainedStats(errorMessage(error))
   }
 }
 
@@ -170,7 +171,7 @@ export function compactConversationBlobs(
       compacted: true,
     }
   } catch (error) {
-    return fallback(error instanceof Error ? error.message : String(error))
+    return fallback(errorMessage(error))
   }
 }
 

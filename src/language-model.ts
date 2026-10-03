@@ -11,6 +11,8 @@ import {
   type BidiStream,
 } from "./transport/connect.js"
 import { trace, traceRequestContextPaths } from "./debug.js"
+import { isExchangeableApiKey } from "./auth.js"
+import { resolveBearerToken } from "./auth-renewal.js"
 import { buildRunRequest, buildHeartbeat } from "./protocol/request.js"
 import { decodeFramePayload } from "./protocol/framing.js"
 import { debugWalkTurnEnded, decodeMessage, encodeMessage } from "./protocol/messages.js"
@@ -164,6 +166,7 @@ import {
   CursorRetryExhaustedError,
   CursorServerError,
   CursorTransportError,
+  isRejectedCredentialError,
   isTransientGrpcStatus,
   retrySuppressedError,
   toCursorProviderError,
@@ -451,7 +454,10 @@ export function connectFrameError(payload: string): CursorProviderError {
     }
     const code = typeof envelope.error?.code === "string" ? envelope.error.code : "unknown"
     if (code === "unauthenticated" || code === "permission_denied") {
-      return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, { code })
+      return new CursorAuthError(`Cursor authentication failed (${code}); reauthenticate with Cursor`, {
+        code,
+        replaySafe: code === "unauthenticated",
+      })
     }
     let retryAfterMs = retryDelayFromValue(
       envelope.error?.retryAfter ?? envelope.error?.retry_after,
@@ -733,30 +739,47 @@ export function createCursorLanguageModel(
   }
 }
 
+/** Bearer token for a new Run from whichever single credential source `options` carries. */
+function resolveRunBearerToken(options: CreateCursorOptions, forceRefresh = false): Promise<string> {
+  return resolveBearerToken({
+    getAccessToken: options.getAccessToken,
+    accessToken: options.accessToken,
+    apiKey: options.apiKey,
+    baseUrl: resolveApiBaseURL(options),
+    forceRefresh,
+  })
+}
+
 async function doStreamImpl(
   modelId: string,
   options: CreateCursorOptions,
   callOptions: LanguageModelV3CallOptions,
 ): Promise<LanguageModelV3StreamResult> {
-  // A raw `crsr_...` API key must be exchanged for a JWT before it can be used
-  // as a Bearer token (the plugin path does this in auth.ts). The accessToken
-  // path is already a JWT from OAuth/key-exchange, so we use it as-is.
-  // resolveBearerToken caches apiKey exchanges so we don't hit /auth/exchange
-  // on every turn.
-  const { resolveBearerToken } = await import("./auth.js")
-  const token = await resolveBearerToken({
-    accessToken: options.accessToken,
-    apiKey: options.apiKey,
-    baseUrl: resolveApiBaseURL(options),
-  })
-
   const prompt = callOptions.prompt
   const retryPolicy = resolveRetryPolicy(options.retry)
+  // The Bearer token is resolved for every Run this call opens, including
+  // recovery Runs after a long-held tool: a host `getAccessToken` (or the
+  // apiKey exchange) renews it, so a Run never starts on a token that expired
+  // while the turn was in progress. A held Run being continued keeps the
+  // token it was opened with. After Cursor rejects the credential, the next
+  // open asks the source for a forced renewal.
+  let forceCredentialRefresh = false
+  const credentialRenewable = Boolean(options.getAccessToken)
+    || (!options.accessToken && options.apiKey !== undefined && isExchangeableApiKey(options.apiKey))
+  let prefetchedToken: string | undefined
   // pumpWithRecovery owns the complete per-turn attempt budget.  Opening a
   // replacement session here must be a single attempt; otherwise setup retry
   // loops nest inside recovery and `maxAttempts` no longer caps total Runs.
-  const openSession = (startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean }) =>
-    startSession(modelId, token, callOptions, options, startOptions)
+  const openSession = async (startOptions?: { recovery?: CursorRunRecovery; isolate?: boolean }) => {
+    const forceRefresh = forceCredentialRefresh
+    forceCredentialRefresh = false
+    const prefetched = prefetchedToken
+    prefetchedToken = undefined
+    const token = prefetched !== undefined && !forceRefresh
+      ? prefetched
+      : await resolveRunBearerToken(options, forceRefresh)
+    return startSession(modelId, token, callOptions, options, startOptions)
+  }
 
   // ── Continuation vs fresh turn ──
   // OpenCode embeds *all* historical tool results in every prompt. Only the
@@ -765,13 +788,17 @@ async function doStreamImpl(
   // false "orphaned tool results" errors after Cursor turn_ended and OpenCode
   // started the next step with old tools still in the prompt body.
   const trailingToolResults = extractTrailingToolResults(prompt)
+  let session = findContinuationSession(trailingToolResults)
+  // A call that must open a Run gets its credential before it changes any
+  // session state (plan mode, finishing the prior held Run), so a login that
+  // cannot be renewed fails the turn without side effects.
+  if (!session) prefetchedToken = await resolveRunBearerToken(options)
   // A host may submit an already rendered plan through its canonical stage
   // tool after the Cursor Run has ended. The next call carries that tool result
   // without a Cursor exec id; reconcile the approved mode before a fresh Run.
   if (hasApprovedUncorrelatedPlanStageResult(prompt)) {
     setActiveCursorMode(opencodeSessionKey(callOptions), "agent")
   }
-  let session = findContinuationSession(trailingToolResults)
 
   if (session) {
     // Write pending results onto the held-open Run. A dead stream closes the
@@ -860,6 +887,9 @@ async function doStreamImpl(
             retryPolicy,
             recover: (recovery) => openSession({ recovery }),
             onSession: (next) => { activeSession = next },
+            ...(credentialRenewable
+              ? { renewRejectedCredential: () => { forceCredentialRefresh = true } }
+              : {}),
           })
           try {
             controller.close()
@@ -918,6 +948,13 @@ export async function pumpWithRecovery(input: {
   recover: (recovery: CursorRunRecovery) => Promise<CursorSession>
   onSession?: (session: CursorSession) => void
   maxRecoveries?: number
+  /**
+   * Set when the credential source can renew: called once per turn after
+   * Cursor rejects the token (401 / unauthenticated) before the attempt did
+   * anything, so the reopened Run uses a force-renewed token. This retry does
+   * not count against the transient-failure budget.
+   */
+  renewRejectedCredential?: () => void
 }): Promise<CursorSession> {
   let session = input.initialSession
   const retryPolicy = input.retryPolicy ?? {
@@ -925,7 +962,30 @@ export async function pumpWithRecovery(input: {
     maxAttempts: (input.maxRecoveries ?? 1) + 1,
   }
   const maxRecoveries = retryPolicy.maxAttempts - 1
+  let credentialRenewed = false
   input.onSession?.(session)
+
+  const reopen = async (pumpedSession: CursorSession, failure: CursorProviderError) => {
+    const checkpoint = pumpedSession.resumeCheckpoint
+    const recovery: CursorRunRecovery = failure.checkpointUnusable
+      ? { kind: "rebase", reason: "checkpoint-unusable" }
+      : checkpoint
+        ? {
+            kind: "resume",
+            conversationId: pumpedSession.conversationId,
+            checkpoint: Uint8Array.from(checkpoint),
+          }
+        : { kind: "rebase" }
+    const next = await input.recover(recovery)
+    if (recovery.kind === "resume") {
+      next.usageEstimate = { ...pumpedSession.usageEstimate }
+      next.editToolCalls = new Map(pumpedSession.editToolCalls)
+      // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
+      // session, seeded in startSession) — no handoff needed here.
+    }
+    input.onSession?.(next)
+    return next
+  }
 
   for (let attempt = 0; ; attempt++) {
     const pumpedSession = session
@@ -947,6 +1007,23 @@ export async function pumpWithRecovery(input: {
         replaySafe: error instanceof CursorProviderError ? error.replaySafe : false,
         fallback: "Cursor Run interrupted",
       })
+      if (
+        input.renewRejectedCredential
+        && !credentialRenewed
+        && isRejectedCredentialError(failure)
+        && failure.replaySafe
+      ) {
+        credentialRenewed = true
+        trace(
+          `Run credential rejected: sessionId=${pumpedSession.sessionId} err=${failure.message} ` +
+            `— renewing the token and reopening once`,
+        )
+        sessionManager.close(pumpedSession, "remote-error", failure)
+        input.renewRejectedCredential()
+        session = await reopen(pumpedSession, failure)
+        attempt--
+        continue
+      }
       if (!failure.transient) throw failure
       const checkpoint = pumpedSession.resumeCheckpoint
       if (!failure.replaySafe && !checkpoint) {
@@ -968,23 +1045,7 @@ export async function pumpWithRecovery(input: {
       const delayMs = retryDelayMs(failure, attempt + 1, retryPolicy)
       trace(`Run retry backoff: attempt=${attempt + 1}/${maxRecoveries} delayMs=${delayMs}`)
       await sleepForRetry(delayMs, input.abortSignal)
-      const recovery: CursorRunRecovery = failure.checkpointUnusable
-        ? { kind: "rebase", reason: "checkpoint-unusable" }
-        : checkpoint
-          ? {
-              kind: "resume",
-              conversationId: pumpedSession.conversationId,
-              checkpoint: Uint8Array.from(checkpoint),
-            }
-          : { kind: "rebase" }
-      session = await input.recover(recovery)
-      if (recovery.kind === "resume") {
-        session.usageEstimate = { ...pumpedSession.usageEstimate }
-        session.editToolCalls = new Map(pumpedSession.editToolCalls)
-        // mirroredTodos rides along via rememberMirroredTodos (per-OpenCode-
-        // session, seeded in startSession) — no handoff needed here.
-      }
-      input.onSession?.(session)
+      session = await reopen(pumpedSession, failure)
     } finally {
       sessionManager.endPump(pumpedSession, pumpOwner)
     }
@@ -1592,12 +1653,7 @@ async function startSession(
 
   session.reopenWithUserMessage = async (text: string) => {
     abortIfNeeded()
-    const { resolveBearerToken } = await import("./auth.js")
-    const freshToken = await resolveBearerToken({
-      accessToken: options.accessToken,
-      apiKey: options.apiKey,
-      baseUrl: resolveApiBaseURL(options),
-    })
+    const freshToken = await resolveRunBearerToken(options)
     abortIfNeeded()
     // Do not pass OpenCode's abortSignal into the h2 stream: a tool-calls abort
     // must not tear down a Run we still need to pump. Check abort around open.

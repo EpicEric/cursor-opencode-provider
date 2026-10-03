@@ -1,20 +1,31 @@
-import { CURSOR_API_HOST, CURSOR_WEBSITE_HOST } from "./shared.js"
+import { CURSOR_API_HOST, CURSOR_OAUTH_CLIENT_ID, CURSOR_WEBSITE_HOST } from "./shared.js"
 import { withAbortDeadline } from "./deadline.js"
+import { errorMessage } from "./debug.js"
 
 const API_BASE = `https://${CURSOR_API_HOST}`
 const AUTH_REQUEST_TIMEOUT_MS = 5_000
+/** Cursor IDE aborts its session refresh after 20 s (`_performAccessTokenRefresh`). */
+const SESSION_REFRESH_TIMEOUT_MS = 20_000
+/** Server error code Cursor's IDE and CLI both surface as a sign-in policy block. */
+const SIGN_IN_POLICY_VIOLATION = "sign_in_policy_violation"
+
+/**
+ * How an API key exchange failed. A policy block (403
+ * `sign_in_policy_violation`, as Cursor CLI's `loginWithApiKey` reports it) and
+ * an authentication refusal (401/403) are final for that key; anything else —
+ * rate limit, timeout, server or network failure — is worth retrying later.
+ */
+export type AuthExchangeFailureKind = "policy" | "rejected" | "transient"
 
 export class AuthExchangeError extends Error {
-  constructor(message: string, public cause?: unknown) {
+  constructor(
+    message: string,
+    public cause?: unknown,
+    public readonly kind: AuthExchangeFailureKind = "transient",
+    public readonly status?: number,
+  ) {
     super(message)
     this.name = "AuthExchangeError"
-  }
-}
-
-export class AuthRefreshError extends Error {
-  constructor(message: string, public cause?: unknown) {
-    super(message)
-    this.name = "AuthRefreshError"
   }
 }
 
@@ -71,19 +82,29 @@ function base64url(bytes: Uint8Array): string {
     .replace(/=+$/, "")
 }
 
+/** A raw Cursor API key (as opposed to a JWT already exchanged from one). */
+export function isExchangeableApiKey(value: string): boolean {
+  return value.startsWith("crsr_")
+}
+
 // ── Mode A: pass-through auth token ──
 
 export function useAuthToken(token: string): { accessToken: string } {
   return { accessToken: token }
 }
 
-// ── Mode B: API key exchange + refresh ──
+// ── Mode B: API key exchange ──
 
 export type TokenPair = {
   accessToken: string
   refreshToken: string
 }
 
+/**
+ * Exchange a raw `crsr_` API key for a short-lived JWT. This is also how an
+ * API-key login is renewed: Cursor CLI re-runs the exchange and never uses the
+ * returned refresh token (`auth-refresh.ts` → `loginWithApiKey`).
+ */
 export async function exchangeApiKey(
   apiKey: string,
   baseUrl = API_BASE,
@@ -107,8 +128,22 @@ export async function exchangeApiKey(
         throw new AuthExchangeError("API key exchange request failed", cause)
       }
       if (!res.ok) {
+        let errorCode: unknown
+        if (res.status === 403) {
+          errorCode = (await res.json().catch(() => undefined) as { error?: unknown } | undefined)?.error
+        }
+        // Only an authentication refusal says the key itself is bad; rate
+        // limits, timeouts, and server errors are worth another attempt.
+        const kind: AuthExchangeFailureKind = errorCode === SIGN_IN_POLICY_VIOLATION
+          ? "policy"
+          : res.status === 401 || res.status === 403 ? "rejected" : "transient"
         throw new AuthExchangeError(
-          `API key exchange failed: ${res.status} ${res.statusText}`,
+          kind === "policy"
+            ? `API key exchange blocked by Cursor sign-in policy (${SIGN_IN_POLICY_VIOLATION})`
+            : `API key exchange failed: ${res.status} ${res.statusText}`,
+          undefined,
+          kind,
+          res.status,
         )
       }
       let body: Record<string, unknown>
@@ -125,109 +160,80 @@ export async function exchangeApiKey(
   )
 }
 
-export async function refreshAccessToken(
-  refreshToken: string,
-  baseUrl = API_BASE,
-): Promise<TokenPair> {
-  return withAbortDeadline(
-    AUTH_REQUEST_TIMEOUT_MS,
-    () => new AuthRefreshError("Token refresh timed out"),
-    async (signal) => {
-      let res: Response
-      try {
-        res = await fetch(`${baseUrl}/auth/token`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refreshToken }),
-          signal,
-        })
-      } catch (cause) {
-        throw new AuthRefreshError("Token refresh request failed", cause)
-      }
-      if (!res.ok) {
-        throw new AuthRefreshError(
-          `Token refresh failed: ${res.status} ${res.statusText}`,
-        )
-      }
-      let body: Record<string, unknown>
-      try {
-        body = await res.json() as Record<string, unknown>
-      } catch (cause) {
-        throw new AuthRefreshError("Token refresh returned malformed JSON", cause)
-      }
-      if (typeof body.accessToken !== "string" || typeof body.refreshToken !== "string") {
-        throw new AuthRefreshError("Refresh response missing tokens")
-      }
-      return { accessToken: body.accessToken, refreshToken: body.refreshToken }
-    },
-  )
-}
+// ── Browser-login session refresh ──
 
-// Cache JWTs obtained via API-key exchange so doStream doesn't re-exchange
-// on every turn when the caller only supplied `apiKey`.
-const _apiKeyTokenCache = new Map<string, TokenPair>()
-const inflightBearer = new Map<string, Promise<string>>()
-
-/** Clear the apiKey→JWT cache (tests). */
-export function clearBearerTokenCache(): void {
-  _apiKeyTokenCache.clear()
-  inflightBearer.clear()
-}
+export type SessionRefreshResult =
+  | { ok: true; accessToken: string }
+  | {
+      ok: false
+      /**
+       * `logout`: Cursor ended the session. `policy`: a sign-in policy blocks
+       * it. Both are final for this token. `transient`: try again later.
+       */
+      kind: "logout" | "policy" | "transient"
+      status?: number
+      message: string
+    }
 
 /**
- * Resolve a Bearer JWT for Cursor API calls. Prefer an already-exchanged
- * `accessToken`; otherwise exchange (and cache) from `apiKey`, refreshing
- * when the cached JWT is near expiry.
+ * Renew a browser-login session token, exactly as Cursor's IDE does
+ * (`_performAccessTokenRefresh`): `POST /oauth/token` with a refresh_token
+ * grant and the IDE's client id. The response carries no new refresh token;
+ * the IDE stores the new access token as both, and so must callers.
  *
- * `apiKey` is only ever a raw exchangeable secret when it has Cursor's
- * `crsr_` prefix. Callers that generically forward whatever credential value
- * they hold — e.g. a host's package-agnostic "aisdk:" SDK loader, which
- * doesn't distinguish our OAuth vs. API-key connection methods and may pass
- * an already-issued JWT through the `apiKey` field — hand us a token that's
- * already good to use as-is; POSTing it to the exchange endpoint 401s.
+ * A rejected token is not an HTTP error: Cursor answers 200 with
+ * `{"access_token":"","shouldLogout":true}`, so the body decides the outcome.
+ * Never throws; every failure is a classified result.
  */
-export async function resolveBearerToken(input: {
-  accessToken?: string
-  apiKey?: string
-  baseUrl?: string
-}): Promise<string> {
-  if (input.accessToken) return input.accessToken
-  if (!input.apiKey) {
-    throw new Error("Cursor provider: no access token or API key provided")
-  }
-  if (!input.apiKey.startsWith("crsr_")) return input.apiKey
-
-  const baseUrl = input.baseUrl ?? API_BASE
-  const cached = _apiKeyTokenCache.get(input.apiKey)
-  if (cached && !isExpiringSoon(cached.accessToken)) {
-    return cached.accessToken
-  }
-
-  const inflightKey = `${baseUrl}\0${input.apiKey}`
-  const existing = inflightBearer.get(inflightKey)
-  if (existing) return existing
-
-  async function refreshOrExchange(): Promise<string> {
-    if (cached) {
-      try {
-        const refreshed = await refreshAccessToken(cached.refreshToken, baseUrl)
-        _apiKeyTokenCache.set(input.apiKey!, refreshed)
-        return refreshed.accessToken
-      } catch {
-        // Fall through to a fresh exchange.
-      }
-    }
-    const pair = await exchangeApiKey(input.apiKey!, baseUrl)
-    _apiKeyTokenCache.set(input.apiKey!, pair)
-    return pair.accessToken
-  }
-
-  const pending = refreshOrExchange()
-  inflightBearer.set(inflightKey, pending)
+export async function refreshCursorSession(
+  refreshToken: string,
+  baseUrl = API_BASE,
+): Promise<SessionRefreshResult> {
   try {
-    return await pending
-  } finally {
-    if (inflightBearer.get(inflightKey) === pending) inflightBearer.delete(inflightKey)
+    return await withAbortDeadline(
+      SESSION_REFRESH_TIMEOUT_MS,
+      () => new Error("session refresh timed out"),
+      async (signal): Promise<SessionRefreshResult> => {
+        const res = await fetch(`${baseUrl}/oauth/token`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-cursor-client-type": "cli",
+          },
+          body: JSON.stringify({
+            grant_type: "refresh_token",
+            client_id: CURSOR_OAUTH_CLIENT_ID,
+            refresh_token: refreshToken,
+          }),
+          signal,
+        })
+        if (!res.ok) {
+          return {
+            ok: false,
+            kind: "transient",
+            status: res.status,
+            message: `session refresh failed: ${res.status} ${res.statusText}`,
+          }
+        }
+        const body = await res.json().catch(() => undefined) as Record<string, unknown> | undefined
+        if (body?.shouldLogout === true) {
+          return body.error === SIGN_IN_POLICY_VIOLATION
+            ? { ok: false, kind: "policy", status: res.status, message: `session blocked by Cursor sign-in policy (${SIGN_IN_POLICY_VIOLATION})` }
+            : { ok: false, kind: "logout", status: res.status, message: "Cursor ended the session (shouldLogout)" }
+        }
+        // The IDE would store an empty token here; treat it as a failed attempt.
+        if (typeof body?.access_token !== "string" || body.access_token === "") {
+          return { ok: false, kind: "transient", status: res.status, message: "session refresh returned no access token" }
+        }
+        return { ok: true, accessToken: body.access_token }
+      },
+    )
+  } catch (cause) {
+    return {
+      ok: false,
+      kind: "transient",
+      message: `session refresh request failed: ${errorMessage(cause)}`,
+    }
   }
 }
 

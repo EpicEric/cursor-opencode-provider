@@ -3,13 +3,18 @@ import { cursorApiBaseURL } from "../plugin-core.js"
 import {
   buildLoginUrl,
   decodeJwtExpiryMs,
-  exchangeApiKey,
   generatePkceChallenge,
   generatePkceParams,
-  isExpiringSoon,
+  isExchangeableApiKey,
   pollForTokens,
-  refreshAccessToken,
 } from "../auth.js"
+import {
+  renewSessionIfDue,
+  resolveApiKeyToken,
+  type AccessTokenRequest,
+} from "../auth-renewal.js"
+import { CursorAuthError, CursorProviderError } from "../errors.js"
+import { errorMessage } from "../debug.js"
 import { CURSOR_INTEGRATION_ID } from "./catalog.js"
 import type {
   CredentialOAuth,
@@ -35,6 +40,15 @@ function websiteURL(): string {
   return process.env.CURSOR_WEBSITE_URL ?? `https://${CURSOR_WEBSITE_HOST}`
 }
 
+/** `expires` of a session credential: the JWT's own expiry, as OpenCode's built-in OAuth integrations store it. */
+function sessionExpires(token: string): number {
+  return decodeJwtExpiryMs(token) ?? Date.now()
+}
+
+function sessionTokensOf(credential: CredentialOAuth) {
+  return { accessToken: credential.access, refreshToken: credential.refresh || credential.access }
+}
+
 /** Browser (PKCE) login: open URL, then poll until Cursor hands back tokens. */
 async function authorizeOAuth() {
   const params = generatePkceParams()
@@ -52,25 +66,40 @@ async function authorizeOAuth() {
         methodID: CURSOR_OAUTH_METHOD_ID,
         access: result.accessToken,
         refresh: result.refreshToken,
-        expires: decodeJwtExpiryMs(result.accessToken) ?? Date.now(),
+        expires: sessionExpires(result.accessToken),
       }),
     ),
   }
 }
 
 /**
- * Renew an expiring Cursor JWT. The host calls this lazily when the stored
- * credential is close to expiry, so it must not assume it runs on every request.
+ * Host-driven session renewal (`POST /oauth/token`, as Cursor's IDE does).
+ * OpenCode 2.0 calls this when the stored `expires` is within five minutes
+ * (`packages/core/src/integration.ts`, `connection.resolve`) and persists the
+ * result. A session this process already renewed in memory is handed over
+ * instead of renewed again. A transient failure returns the unchanged session
+ * with `expires` moved to the next allowed attempt, so the host keeps working
+ * and asks again later; only a session Cursor ended, or one that expired
+ * unrenewed, throws.
  */
-async function refreshOAuth(credential: CredentialOAuth): Promise<CredentialOAuth> {
-  const tokens = await refreshAccessToken(credential.refresh, cursorApiBaseURL())
+export async function refreshOAuth(credential: CredentialOAuth): Promise<CredentialOAuth> {
+  const renewal = await renewSessionIfDue(sessionTokensOf(credential), { baseUrl: cursorApiBaseURL() })
+  const methodID = credential.methodID || CURSOR_OAUTH_METHOD_ID
+  const metadata = credential.metadata === undefined ? {} : { metadata: credential.metadata }
+  if (renewal.renewed) {
+    return {
+      type: "oauth",
+      methodID,
+      access: renewal.accessToken,
+      refresh: renewal.accessToken,
+      expires: sessionExpires(renewal.accessToken),
+      ...metadata,
+    }
+  }
   return {
-    type: "oauth",
-    methodID: credential.methodID || CURSOR_OAUTH_METHOD_ID,
-    access: tokens.accessToken,
-    refresh: tokens.refreshToken,
-    expires: decodeJwtExpiryMs(tokens.accessToken) ?? Date.now(),
-    ...(credential.metadata === undefined ? {} : { metadata: credential.metadata }),
+    ...credential,
+    methodID,
+    expires: renewal.retryAt ?? sessionExpires(credential.access),
   }
 }
 
@@ -104,49 +133,59 @@ export function applyCursorIntegration(draft: IntegrationDraft): void {
 }
 
 /**
- * Turn a stored credential into a Cursor access token.
+ * Turn a stored credential into a Cursor access token. The two credential
+ * kinds are handled separately and never substitute for each other.
  *
- * OAuth credentials already hold a JWT (the host refreshes them via `refresh`
- * above). A `key` credential is the raw `crsr_…` API key, which Cursor requires us
- * to exchange for a short-lived JWT — mirroring the classic plugin's behavior.
+ * - `oauth`: the session token, renewed in memory once it is due by Cursor's
+ *   IDE window (the host itself refreshes only in the last five minutes; it
+ *   then persists the renewal through `refreshOAuth`).
+ * - `key`: a raw `crsr_…` API key (from /connect or `CURSOR_API_KEY`),
+ *   exchanged for a short-lived JWT and re-exchanged near its expiry. Any
+ *   other value is an already-issued token and is used as-is.
+ *
+ * Throws `CursorAuthError` when no usable token can be produced.
  */
 export async function accessTokenFromCredential(
   credential: CredentialValue | undefined,
-): Promise<string | undefined> {
-  if (!credential) return undefined
-
-  if (credential.type === "oauth") {
-    if (credential.access && !isExpiringSoon(credential.access)) return credential.access
-    if (!credential.refresh) return credential.access || undefined
-    try {
-      return (await refreshOAuth(credential)).access
-    } catch {
-      // Fall back to the existing token; the call may still succeed.
-      return credential.access || undefined
-    }
+  request: AccessTokenRequest = {},
+): Promise<string> {
+  const force = request.forceRefresh === true
+  if (credential?.type === "oauth") {
+    return (await renewSessionIfDue(sessionTokensOf(credential), { baseUrl: cursorApiBaseURL(), force })).accessToken
   }
-
-  if (credential.type === "key") {
-    // Already a JWT (e.g. exchanged by an earlier run) — use it directly.
-    if (!credential.key.startsWith("crsr_")) return credential.key
-    try {
-      return (await exchangeApiKey(credential.key, cursorApiBaseURL())).accessToken
-    } catch {
-      return undefined
-    }
+  if (credential?.type === "key") {
+    if (!isExchangeableApiKey(credential.key)) return credential.key
+    return (await resolveApiKeyToken(credential.key, { baseUrl: cursorApiBaseURL(), force })).accessToken
   }
-
-  return undefined
+  throw new CursorAuthError("No Cursor login found; connect Cursor first", { code: "no_credential" })
 }
 
-/** Resolve the active Cursor connection into an access token, if any. */
+/**
+ * Current access token of the active Cursor connection, for a Run. Throws a
+ * `CursorAuthError` that says why when there is none.
+ */
+export async function requireCursorAccessToken(
+  integration: IntegrationDomain,
+  request: AccessTokenRequest = {},
+): Promise<string> {
+  let credential: CredentialValue | undefined
+  try {
+    const connection = await integration.connection.active(CURSOR_INTEGRATION_ID)
+    credential = connection ? await integration.connection.resolve(connection) : undefined
+  } catch (error) {
+    // The host's resolve runs our refreshOAuth; keep its classified error.
+    if (error instanceof CursorProviderError) throw error
+    throw new CursorAuthError(`Cursor login could not be loaded (${errorMessage(error)})`, { cause: error })
+  }
+  return accessTokenFromCredential(credential, request)
+}
+
+/** Access token of the active Cursor connection, or undefined (model discovery). */
 export async function resolveCursorAccessToken(
   integration: IntegrationDomain,
 ): Promise<string | undefined> {
   try {
-    const connection = await integration.connection.active(CURSOR_INTEGRATION_ID)
-    if (!connection) return undefined
-    return await accessTokenFromCredential(await integration.connection.resolve(connection))
+    return await requireCursorAccessToken(integration)
   } catch {
     return undefined
   }

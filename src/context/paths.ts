@@ -94,9 +94,18 @@ export function resolveHostCacheDir(env: HostPathEnv = process.env): string {
   return bridgeGlobalCacheDir() ?? openCodeGlobalCacheDir(env)
 }
 
-/** Native OpenCode global config dir. */
-export function opencodeGlobalConfigDir(): string {
-  return path.join(resolveHome(), ".config", "opencode")
+function xdgConfigHome(env: HostPathEnv = process.env): string {
+  if (env.XDG_CONFIG_HOME && env.XDG_CONFIG_HOME.length > 0) return env.XDG_CONFIG_HOME
+  return path.join(resolveHome(env), ".config")
+}
+
+/**
+ * Native OpenCode global config dir: `$XDG_CONFIG_HOME/opencode`, otherwise
+ * `~/.config/opencode` — OpenCode's `Global.Path.config` (`xdg-basedir`
+ * `xdgConfig`, `packages/core/src/global.ts`), the same in 1.x and 2.0.
+ */
+export function opencodeGlobalConfigDir(env: HostPathEnv = process.env): string {
+  return path.join(xdgConfigHome(env), "opencode")
 }
 
 /**

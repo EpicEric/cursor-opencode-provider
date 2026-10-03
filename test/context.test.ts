@@ -11,8 +11,21 @@ import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
 
 describe("collectRules / buildRequestContext", () => {
   let root: string
+  // Global discovery (agents, skills, rules) reads $XDG_CONFIG_HOME/opencode
+  // (else ~/.config/opencode) and ~/.claude; an empty HOME with no
+  // XDG_CONFIG_HOME keeps the expected catalogs exact on machines with their
+  // own global agents or rules.
+  let isolatedHome: string
+  let prevHome: string | undefined
+  let prevXdgConfig: string | undefined
 
   beforeAll(async () => {
+    prevHome = process.env.HOME
+    prevXdgConfig = process.env.XDG_CONFIG_HOME
+    delete process.env.XDG_CONFIG_HOME
+    isolatedHome = path.join(os.tmpdir(), `cursor-ctx-home-${process.pid}-${Date.now()}`)
+    await mkdir(isolatedHome, { recursive: true })
+    process.env.HOME = isolatedHome
     root = path.join(os.tmpdir(), `cursor-ctx-${process.pid}-${Date.now()}`)
     await mkdir(root, { recursive: true })
     await writeFile(path.join(root, "AGENTS.md"), "# Project rules\nUse bun.\n")
@@ -42,7 +55,12 @@ describe("collectRules / buildRequestContext", () => {
   })
 
   afterAll(async () => {
+    if (prevHome === undefined) delete process.env.HOME
+    else process.env.HOME = prevHome
+    if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = prevXdgConfig
     await rm(root, { recursive: true, force: true })
+    await rm(isolatedHome, { recursive: true, force: true })
   })
 
   it("loads AGENTS.md and honors .cursor paths listed in instructions", async () => {

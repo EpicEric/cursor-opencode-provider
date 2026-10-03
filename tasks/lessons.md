@@ -453,6 +453,33 @@
   lifecycle/zero-tool turn that re-advertises the frozen catalog must not ask
   for a call the host would refuse.
 
+## 2026-10-01 — Credential renewal: verify against the right Cursor client
+
+- **Cursor CLI is not the reference for every flow.** It never renews a
+  browser login (it only re-exchanges an API key), so "do what the CLI does"
+  left OAuth with nothing to copy. The IDE bundle
+  (`/Applications/Cursor.app/.../workbench.desktop.main.js`) does renew, through
+  `/oauth/token`. When one client lacks a flow, check the other before
+  concluding Cursor has none, and confirm with one live request.
+- **The endpoint we called did not exist.** `/auth/token` answered 404 for both
+  credential kinds; the API-key symptom in #35 hid that OAuth was equally
+  broken. Test the refresh path itself, not just the caller's fallback.
+- **A failed refresh can be HTTP 200.** `/oauth/token` reports a dead session as
+  `{access_token:"", shouldLogout:true}`. Status-code handling alone would have
+  stored an empty token, as the IDE itself would.
+- **Never let one credential kind stand in for another.** A browser login and an
+  API key are different credentials with different renewal; a fallback between
+  them hides which one is broken (user correction on PR #36's review).
+- **Provider options are not private.** OpenCode serves them unredacted from
+  `/provider`; only functions are dropped by its JSON serialization. Hand the
+  provider a token function, never a raw key.
+- **Do no more with credentials than OpenCode's own providers do.** Its OAuth
+  plugins (codex, xai, copilot in 1.x; openai/opencode integrations in 2.0)
+  renew only when a request needs a token, store the real expiry, and hand the
+  SDK a function rather than a token. A background timer and a fake
+  "renewal-due" `expires` went beyond that and were removed (user decision);
+  only *when* a token is due follows Cursor's own client (IDE 1272 h window).
+
 ## 2026-08-25 — Pricing gate before every release
 
 - **CI regenerating pricing is a backstop, not permission to skip the local

@@ -44,6 +44,7 @@ describe("frozen request_context", () => {
   let cacheRoot: string
   let sandboxHome: string
   const previousHome = process.env.HOME
+  const previousXdgConfig = process.env.XDG_CONFIG_HOME
   const previousUserProfile = process.env.USERPROFILE
   const previousBridge = (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
 
@@ -51,10 +52,12 @@ describe("frozen request_context", () => {
     root = path.join(os.tmpdir(), `cursor-frozen-ctx-${process.pid}-${Date.now()}`)
     cacheRoot = path.join(os.tmpdir(), `cursor-frozen-cache-${process.pid}-${Date.now()}`)
     sandboxHome = path.join(os.tmpdir(), `cursor-frozen-home-${process.pid}-${Date.now()}`)
-    // loadMergedConfig overlays $HOME/.config/opencode. A developer machine with
-    // mcp.github in that global file would make github_create_issue look like a
-    // configured MCP tool before the project opencode.json exists.
+    // loadMergedConfig overlays the global OpenCode config ($XDG_CONFIG_HOME,
+    // else $HOME/.config). A developer machine with mcp.github in that global
+    // file would make github_create_issue look like a configured MCP tool
+    // before the project opencode.json exists.
     process.env.HOME = sandboxHome
+    delete process.env.XDG_CONFIG_HOME
     process.env.USERPROFILE = sandboxHome
     delete (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]
     setHostCacheDirOverride(cacheRoot)
@@ -76,6 +79,8 @@ describe("frozen request_context", () => {
     setHostCacheDirOverride(undefined)
     if (previousHome === undefined) delete process.env.HOME
     else process.env.HOME = previousHome
+    if (previousXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = previousXdgConfig
     if (previousUserProfile === undefined) delete process.env.USERPROFILE
     else process.env.USERPROFILE = previousUserProfile
     if (previousBridge === undefined) delete (globalThis as Record<PropertyKey, unknown>)[HOST_PATH_BRIDGE]

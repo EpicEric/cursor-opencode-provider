@@ -26,6 +26,7 @@ import {
   parseAnswerSegments,
 } from "./ask-question.js"
 import { decodeMessageSparse } from "./messages.js"
+import { errorMessage } from "../debug.js"
 
 const PLAN_ADJECTIVES = [
   "brave",
@@ -440,7 +441,7 @@ export function writeOpencodePlanFile(
     mkdirSync(path.dirname(planPath), { recursive: true })
     writeFileSync(planPath, markdown, "utf-8")
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
+    const message = errorMessage(err)
     return { ok: false, error: `Failed to write plan file: ${message}` }
   }
   return {

@@ -23,6 +23,11 @@ let _debugFile: string | undefined
 let _debugFileUsesManagedDirectory = false
 let _announcedLogPath = false
 
+/** Message of an unknown thrown value, for log lines and error text. */
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /** Whether `CURSOR_PROVIDER_DEBUG` is enabled for this process. */
 export function isDebugEnabled(): boolean {
   return DEBUG_ENABLED

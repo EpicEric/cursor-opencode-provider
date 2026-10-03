@@ -78,7 +78,8 @@ OpenCode
 | Model pricing | `src/pricing.ts`, `src/pricing-data.ts` | Cursor docs → classic `cost` + OpenCode 2.0 cost tiers; regenerate via `bun run generate:pricing` |
 | Language model | `src/language-model.ts` | AI SDK `LanguageModelV3` (`doStream` / `doGenerate`) |
 | Session | `src/session.ts` | Held-open agent Run + pending exec correlation |
-| Auth / models | `src/auth.ts`, `src/models.ts` | PKCE/API key, JWT refresh, `cursor-models.json` cache |
+| Auth / models | `src/auth.ts`, `src/models.ts` | PKCE/API key exchange, session refresh (`/oauth/token`), `cursor-models.json` cache |
+| Credential renewal | `src/auth-renewal.ts` | Separate session / API-key renewal, backoff + final-failure latch, on-demand renewal, Bearer resolution (`getAccessToken` → `accessToken` → `apiKey`) |
 | Agent host | `src/agent-url.ts` | `GetServerConfig` → region-specific Run host (in-memory memo) |
 | Request context | `src/context/` | Rules, skills, agents, plugins, git, layout, env |
 | Host paths | `src/context/paths.ts` | Native OpenCode cache/data defaults with optional structural host path bridge; project metadata under `<host-cache>/projects/<slug>/` |
@@ -146,7 +147,7 @@ Two 1.x hooks have no 2.0 equivalent and are emulated:
 `src/context/build.ts` builds Cursor `RequestContext` from OpenCode-shaped discovery:
 
 - First of `AGENTS.md` / `CLAUDE.md` / `CONTEXT.md` walking up to the git worktree
-- Global `~/.config/opencode/AGENTS.md` and `~/.claude/CLAUDE.md`
+- Global `$XDG_CONFIG_HOME/opencode/AGENTS.md` (default `~/.config/opencode`, OpenCode's `Global.Path.config`) and `~/.claude/CLAUDE.md`
 - `instructions` globs from merged `opencode.json` / `opencode.jsonc` (including `.cursor/` **only** when listed)
 - `.opencode` agents/skills/plugins, plus `.claude` / `.agents` skill fallbacks
 - Git + project layout + env
@@ -157,6 +158,7 @@ When changing rule/skill discovery, keep parity with OpenCode behavior and updat
 
 - **Release / pricing gate:** before any version bump, `v*` tag, tag push, or publish, run `bun run generate:pricing` and `bun run check:pricing` successfully in this turn and commit mapping/`pricing-data.ts` updates first. See HARD STOP section above. CI re-running pricing is validation, not permission to skip the local gate.
 - **Agent host:** resolve via `GetServerConfig` (`agentUrlConfig.agentnUrl`). Memoize once per process in memory; never write to disk; never silently fall back to a legacy global host on failure.
+- **Auth renewal:** a browser login and an API key are different credentials, renewed by separate paths that never stand in for each other. There is no `/auth/token` route (Cursor answers 404). The browser-login session (`type:"session"` JWT, 60-day life) renews exactly as Cursor's IDE does (`_performAccessTokenRefresh` in the app's `workbench.desktop.main.js`): `POST /oauth/token` `{grant_type:"refresh_token", client_id: CURSOR_OAUTH_CLIENT_ID, refresh_token}`; the response has no refresh token, so the new access token is stored as both. A rejected session is **HTTP 200** `{access_token:"", shouldLogout:true}` (`error:"sign_in_policy_violation"` for a policy block); read the body, not the status. Renewal is due 1272 h before expiry (IDE `hir`) and happens only on demand, when a request needs a token (Run open, model discovery, endpoint warmup) — no timer, matching OpenCode's own OAuth providers. Never depend on renewing an expired session. An API-key login renews only by re-exchanging the raw key (`/auth/exchange_user_api_key`), as Cursor CLI does; its refresh token is unused and not stored. Transient failures keep the current token while valid and back off; `shouldLogout`, policy blocks, and rejected keys latch per credential. Plugins hand the provider a `getAccessToken` function and put no token or key in serializable options, exactly as OpenCode's own OAuth providers do (codex/xai/copilot loaders return a dummy `apiKey` plus a `fetch` that calls `getAuth()` per request); OpenCode returns provider options unredacted from `/provider`, and functions drop out of that JSON. A raw `crsr_` key is never sent as Bearer. Renewals are persisted only if the stored credential is unchanged (compare-and-set). OpenCode 2.0 stores the JWT expiry as `expires` (as its built-in OAuth integrations do) and calls `refresh` within five minutes of it; in between, the plugin renews in memory when due and `refresh` hands that renewal to the host to persist.
 - **URL options:** `apiBaseURL` (auth/models/GetServerConfig) vs `agentBaseURL` (Run stream) are separate. Legacy `baseURL` aliases `agentBaseURL` only.
 - **Host validation:** explicit agent overrides and GetServerConfig results must be HTTPS `*.cursor.sh`; reject others.
 - **Telemetry:** `GetServerConfig` sends `telem_enabled: false` by default; opt in via `telemetryEnabled` or `CURSOR_GET_SERVER_CONFIG_TELEMETRY`.

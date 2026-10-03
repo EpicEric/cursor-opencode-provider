@@ -13,7 +13,7 @@ import {
 import { decodeMessage, encodeMessage } from "../src/protocol/messages.js"
 import type { CursorSession, Frame } from "../src/session.js"
 import { CursorRunInterruptedError } from "../src/transport/connect.js"
-import { CursorRetryExhaustedError } from "../src/errors.js"
+import { CursorAuthError, CursorRetryExhaustedError } from "../src/errors.js"
 
 function fakeSession(id: string, frames: Frame[], writes: Uint8Array[] = []): CursorSession {
   let index = 0
@@ -309,6 +309,72 @@ describe("interrupted Cursor Run handling", () => {
     })
     expect(recoveries).toBe(1)
     expect(String((failure as Error).message).toLowerCase()).not.toMatch(/unavailable|exhausted/)
+  })
+
+  function endStreamError(code: string): Frame {
+    return { flags: 0x02, payload: new TextEncoder().encode(JSON.stringify({ error: { code } })) }
+  }
+
+  const turnEnded = () => serverFrame({ interaction_update: { turn_ended: { input_tokens: 1, output_tokens: 1 } } })
+
+  it("renews a rejected credential once and reopens before any output, outside the retry budget", async () => {
+    let renewals = 0
+    const recoveries: unknown[] = []
+    const finalSession = await pumpWithRecovery({
+      initialSession: fakeSession("expired-token", [endStreamError("unauthenticated")]),
+      controller: controller([]),
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+      recover: async (recovery) => {
+        recoveries.push(recovery)
+        return fakeSession("renewed-token", [turnEnded()])
+      },
+      renewRejectedCredential: () => { renewals++ },
+    })
+    expect(finalSession.sessionId).toBe("renewed-token")
+    expect(renewals).toBe(1)
+    expect(recoveries).toEqual([{ kind: "rebase" }])
+  })
+
+  it("renews a rejected credential only once per turn", async () => {
+    let renewals = 0
+    const failure = await pumpWithRecovery({
+      initialSession: fakeSession("expired-1", [endStreamError("unauthenticated")]),
+      controller: controller([]),
+      recover: async () => fakeSession("expired-2", [endStreamError("unauthenticated")]),
+      renewRejectedCredential: () => { renewals++ },
+    }).catch((e: unknown) => e)
+    expect(failure).toBeInstanceOf(CursorAuthError)
+    expect(renewals).toBe(1)
+  })
+
+  it("does not renew when the source cannot, after visible output, or on permission_denied", async () => {
+    const cases = [
+      { session: fakeSession("static", [endStreamError("unauthenticated")]), renew: false },
+      {
+        session: fakeSession("after-output", [
+          serverFrame({ interaction_update: { text_delta: { text: "partial" } } }),
+          endStreamError("unauthenticated"),
+        ]),
+        renew: true,
+      },
+      { session: fakeSession("denied", [endStreamError("permission_denied")]), renew: true },
+    ]
+    for (const { session, renew } of cases) {
+      let renewals = 0
+      let recoveries = 0
+      const failure = await pumpWithRecovery({
+        initialSession: session,
+        controller: controller([]),
+        recover: async () => {
+          recoveries++
+          return fakeSession("unexpected", [turnEnded()])
+        },
+        ...(renew ? { renewRejectedCredential: () => { renewals++ } } : {}),
+      }).catch((e: unknown) => e)
+      expect(failure).toBeInstanceOf(CursorAuthError)
+      expect(renewals).toBe(0)
+      expect(recoveries).toBe(0)
+    }
   })
 
   it("uses retry.maxAttempts as the total Run attempt budget", async () => {
