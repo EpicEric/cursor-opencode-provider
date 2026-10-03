@@ -70,7 +70,8 @@
     "LICENSE",
     "DISCLAIMER.md",
     "SECURITY.md",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",

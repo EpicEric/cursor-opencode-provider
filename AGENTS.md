@@ -37,7 +37,7 @@ Publish surface is `dist/` only (`files` in `package.json`). Always rebuild befo
 
 ## HARD STOP — release / version bump / tag gate (non-optional)
 
-**Do not edit `package.json` `"version"`, create a `v*` tag, push a `v*` tag, or run `npm publish` until the pricing gate below has succeeded in *this* turn and any mapping/`pricing-data.ts` updates are committed.** Skipping it is a process failure, not an acceptable shortcut. CI regenerating pricing later is **not** a substitute: unmapped Cursor display names fail publish after the tag already exists, forcing retags and wasted release cycles (this happened on `v0.6.4`).
+**Do not edit `package.json` `"version"`, create a `v*` tag, push a `v*` tag, or run `npm publish` until the pricing gate below has succeeded in *this* turn, any mapping/`pricing-data.ts` updates are committed, and `CHANGELOG.md` is finalized.** Skipping either is a process failure, not an acceptable shortcut. CI regenerating pricing later is **not** a substitute: unmapped Cursor display names fail publish after the tag already exists, forcing retags and wasted release cycles (this happened on `v0.6.4`).
 
 **Forbidden until the gate passes:**
 - bumping `"version"` in `package.json`
@@ -50,9 +50,10 @@ Publish surface is `dist/` only (`files` in `package.json`). Always rebuild befo
 2. On any `Unmapped pricing/context/capability display name`, update `DISPLAY_NAME_TO_MODEL_ID` or `SKIP_DISPLAY_NAMES` in `scripts/generate-cursor-pricing.ts`, add any new wire id to `test/fixtures/cursor-pricing-models.txt`, regenerate, and **commit that fix first**.
 3. `bun run check:pricing` — must exit 0.
 4. Commit mapping / fixture / `src/pricing-data.ts` changes **before** the version bump commit.
-5. Only then bump version, commit, tag, and push.
+5. Finalize `CHANGELOG.md`: every user-facing change since the last release must be under `## [Unreleased]`; rename that section to `## [X.Y.Z] - YYYY-MM-DD` (**UTC** calendar date of the release), then insert a fresh empty `## [Unreleased]` at the top. See [Changelog](#changelog).
+6. Only then bump version, commit (include the changelog finalization), tag, and push.
 
-If the user asks only to “bump / tag / publish”, still run steps 1–4 first and report the pricing result before touching the version.
+If the user asks only to “bump / tag / publish”, still run steps 1–5 first and report the pricing result and changelog finalization before touching the version.
 
 ## Architecture
 
@@ -139,8 +140,9 @@ Two 1.x hooks have no 2.0 equivalent and are emulated:
 - Prefer minimal, targeted changes. Fix root causes; no temporary workarounds.
 - Do not commit unless the user (or an explicit implementation task) asks.
 - Keep README accurate when behavior users care about changes (auth, env vars, architecture, limitations). Host-specific OpenCode install/auth belongs in `docs/opencode-1.md` and `docs/opencode-2.md`, not back in the README.
+- For user-facing changes, update `CHANGELOG.md` under `## [Unreleased]` in the same change set. Follow [Changelog](#changelog).
 - Tests live in `test/` (Bun test). Mirror protocol/context behavior with unit tests when changing encode/decode or discovery.
-- **Release gate:** any version bump / `v*` tag / publish request must obey the HARD STOP pricing section above. Do not “bump first, check pricing if CI fails.”
+- **Release gate:** any version bump / `v*` tag / publish request must obey the HARD STOP pricing + changelog section above. Do not “bump first, check pricing if CI fails.”
 
 ## Context this provider sends to Cursor
 
@@ -170,7 +172,7 @@ plugin lists, and interaction guidance.
 
 ## Critical behavioral constraints
 
-- **Release / pricing gate:** before any version bump, `v*` tag, tag push, or publish, run `bun run generate:pricing` and `bun run check:pricing` successfully in this turn and commit mapping/`pricing-data.ts` updates first. See HARD STOP section above. CI re-running pricing is validation, not permission to skip the local gate.
+- **Release / pricing gate:** before any version bump, `v*` tag, tag push, or publish, run `bun run generate:pricing` and `bun run check:pricing` successfully in this turn, commit mapping/`pricing-data.ts` updates first, and finalize `CHANGELOG.md` (`[Unreleased]` → dated version + new empty `[Unreleased]`). See HARD STOP and [Changelog](#changelog). CI re-running pricing is validation, not permission to skip the local gate.
 - **Agent host:** resolve via `GetServerConfig` (`agentUrlConfig.agentnUrl`). Memoize once per process in memory; never write to disk; never silently fall back to a legacy global host on failure.
 - **Auth renewal:** a browser login and an API key are different credentials, renewed by separate paths that never stand in for each other. There is no `/auth/token` route (Cursor answers 404). The browser-login session (`type:"session"` JWT, 60-day life) renews exactly as Cursor's IDE does (`_performAccessTokenRefresh` in the app's `workbench.desktop.main.js`): `POST /oauth/token` `{grant_type:"refresh_token", client_id: CURSOR_OAUTH_CLIENT_ID, refresh_token}`; the response has no refresh token, so the new access token is stored as both. A rejected session is **HTTP 200** `{access_token:"", shouldLogout:true}` (`error:"sign_in_policy_violation"` for a policy block); read the body, not the status. Renewal is due 1272 h before expiry (IDE `hir`) and happens only on demand, when a request needs a token (Run open, model discovery, endpoint warmup) — no timer, matching OpenCode's own OAuth providers. Never depend on renewing an expired session. An API-key login renews only by re-exchanging the raw key (`/auth/exchange_user_api_key`), as Cursor CLI does; its refresh token is unused and not stored. Transient failures keep the current token while valid and back off; `shouldLogout`, policy blocks, and rejected keys latch per credential. Plugins hand the provider a `getAccessToken` function and put no token or key in serializable options, exactly as OpenCode's own OAuth providers do (codex/xai/copilot loaders return a dummy `apiKey` plus a `fetch` that calls `getAuth()` per request); OpenCode returns provider options unredacted from `/provider`, and functions drop out of that JSON. A raw `crsr_` key is never sent as Bearer. Renewals are persisted only if the stored credential is unchanged (compare-and-set). OpenCode 2.0 stores the JWT expiry as `expires` (as its built-in OAuth integrations do) and calls `refresh` within five minutes of it; in between, the plugin renews in memory when due and `refresh` hands that renewal to the host to persist.
 - **URL options:** `apiBaseURL` (auth/models/GetServerConfig) vs `agentBaseURL` (Run stream) are separate. Legacy `baseURL` aliases `agentBaseURL` only.
@@ -221,11 +223,39 @@ plugin lists, and interaction guidance.
 | `<hostGlobalDataDir>/plans/` | CreatePlan files when there is no VCS (OpenCode `Global.Path.data` shape via `hostGlobalDataDir`) |
 | OpenCode auth | `~/.local/share/opencode/auth.json` (`$XDG_DATA_HOME`) |
 
+## Changelog
+
+Location: `CHANGELOG.md` (repo root; this is a single-package repo).
+
+**Format** — sections under `## [Unreleased]`:
+
+- `### Breaking Changes` (first if present)
+- `### Added`
+- `### Changed`
+- `### Fixed`
+- `### Removed`
+
+**Rules:**
+
+- New user-facing entries always go under `## [Unreleased]` in the same PR/commit as the change.
+- Entries are one line, brief, and user-facing: lead with what the user will see or can now do. Root-cause narration and implementation detail belong in the commit/PR, not the changelog.
+- Skip pure chore/docs/test/CI-only work unless it changes something operators or integrators must know (for example a publish-breaking pricing map fix that ships in a release).
+- Never modify already-released sections (e.g. `## [0.8.0]`) — they are immutable after the tag exists.
+- On release, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` (UTC date of the release), then insert a fresh empty `## [Unreleased]` above it. Do not leave an empty dated version section.
+- Do not bikeshed changelog section order or bullet formatting in reviews or PRs — keep entries accurate and user-facing; normalize order when finalizing a release.
+
+**Attribution:**
+
+- Internal (from issues): `Fixed foo bar ([#123](https://github.com/oakimov/cursor-opencode-provider/issues/123))`.
+- External contributions: `Added feature X ([#456](https://github.com/oakimov/cursor-opencode-provider/pull/456) by [@username](https://github.com/username))`.
+- For external PRs, add the PR link and contributor credit after GitHub assigns the number, then push the entry before considering the changelog done.
+
 ## Docs map
 
 | File | Purpose |
 |------|---------|
 | `README.md` | User-facing overview, shared model catalog, troubleshooting |
+| `CHANGELOG.md` | User-facing release notes (`[Unreleased]` + dated versions) |
 | `docs/opencode-1.md` | OpenCode 1.x install (classic `plugin` + optional 1.18 `plugin/v2`) |
 | `docs/opencode-2.md` | OpenCode 2.0 install (`plugin/opencode2`) and migration off `ctx.catalog` / the `opencode.json` catalog dump |
 | `AGENTS.md` | Canonical agent/project context (this file) |

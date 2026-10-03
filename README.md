@@ -4,7 +4,7 @@ Use [Cursor](https://cursor.com) subscription models from [OpenCode](https://ope
 
 This project is a custom **AI SDK provider** (`LanguageModelV3`) plus an **OpenCode plugin** that handles authentication and model discovery. Instead of calling a generic chat-completions API, it encodes and decodes Cursor's protobuf agent protocol over HTTP/2 to Cursor's agent backend.
 
-> **Runs unchanged across OpenCode, OpenCode 2.0, and four additional coding agents.** OpenCode loads this plugin natively, including through the dedicated OpenCode 2.0 entrypoint. [OCP — OpenCode Plugin Compatibility](https://github.com/oakimov/opencode-plugin-compat) runs the same published plugin, without a provider fork, in **Kilo Code, MiMo Code, pi, and oh-my-pi**. See [Coding-agent compatibility](#coding-agent-compatibility).
+> **Runs unchanged across OpenCode, OpenCode 2.0, and five additional coding agents.** OpenCode loads this plugin natively, including through the dedicated OpenCode 2.0 entrypoint. [OCP — OpenCode Plugin Compatibility](https://github.com/oakimov/opencode-plugin-compat) runs the same published plugin, without a provider fork, in **Kilo Code, MiMo Code, pi, oh-my-pi, and DeepSeek Harness**. See [Coding-agent compatibility](#coding-agent-compatibility).
 >
 > **Status:** Usable end-to-end for authentication, model discovery, streaming, and tools. See [Known limitations](#known-limitations).
 
@@ -24,11 +24,13 @@ instead of requiring a host-specific Cursor provider.
 | **MiMo Code** | Unchanged through OCP's OpenCode-clone compatibility layer |
 | **pi** | Unchanged through `@opencode-compat/pi-bridge` and pi's provider extension API |
 | **oh-my-pi (omp)** | Unchanged through the same Pi-family bridge |
+| **DeepSeek Harness (dsh)** | Unchanged through `@opencode-compat/dsh-bridge` and DSH's Cordis `LlmAdapter` API |
 
 Start with OCP's host guides:
 
 - [OpenCode clones: Kilo Code and MiMo Code](https://github.com/oakimov/opencode-plugin-compat/blob/main/docs/hosts/opencode-clones.md)
 - [Pi family: pi and oh-my-pi](https://github.com/oakimov/opencode-plugin-compat/blob/main/docs/hosts/pi-family.md)
+- [DSH family: DeepSeek Harness](https://github.com/oakimov/opencode-plugin-compat/blob/main/docs/hosts/dsh-family.md)
 
 OCP is designed to grow by adding host profiles and narrow adapters or bridges,
 so support for other coding agents can be added there while this provider and
@@ -42,7 +44,7 @@ OpenCode driving a Cursor-routed Grok model through this provider:
 
 ## Features
 
-- **Multi-host compatibility** — the same plugin package runs natively in OpenCode and OpenCode 2.0, and unchanged through OCP in Kilo Code, MiMo Code, pi, and oh-my-pi; new host support belongs in the compatibility layer rather than a provider fork
+- **Multi-host compatibility** — the same plugin package runs natively in OpenCode and OpenCode 2.0, and unchanged through OCP in Kilo Code, MiMo Code, pi, oh-my-pi, and DeepSeek Harness; new host support belongs in the compatibility layer rather than a provider fork
 - **OpenCode integration** — registers a `cursor` provider with auth hooks and cached model list
 - **Authentication** — browser OAuth (PKCE), or API key from [cursor.com/settings](https://cursor.com/settings)
 - **Model discovery** — fetches available models from Cursor's API and caches them locally
@@ -253,7 +255,7 @@ bun run generate:pricing  # refresh src/pricing-data.ts from Cursor docs
 bun run check:pricing     # fixture coverage for known model ids
 ```
 
-**HARD STOP before any version bump or `v*` tag:** run `generate:pricing` and `check:pricing` in the same session, fix any unmapped Cursor display names, and commit mapping/`pricing-data.ts` updates **before** touching `"version"` or creating the tag. Publish CI regenerates rates from the live docs and will fail the release on an unmapped name — that is a last line of defense, not the primary check. See `AGENTS.md`.
+**HARD STOP before any version bump or `v*` tag:** run `generate:pricing` and `check:pricing` in the same session, fix any unmapped Cursor display names, commit mapping/`pricing-data.ts` updates, and finalize [`CHANGELOG.md`](CHANGELOG.md) (`[Unreleased]` → dated version) **before** touching `"version"` or creating the tag. Publish CI regenerates rates from the live docs and will fail the release on an unmapped name — that is a last line of defense, not the primary check. See `AGENTS.md` and [Changelog](#changelog).
 
 ## Architecture
 
@@ -388,6 +390,10 @@ Project `instructions` may reference absolute or `~/` paths (OpenCode parity). S
 - **Interrupted Runs resume from checkpoints** — a remote EOF, Connect end-stream, or trailer error is never emitted as a successful `stop`. When the failed Run produced an eligible checkpoint, the provider opens a new RPC for the same conversation and sends that state with `ResumeAction`, so completed text and tool work are not replayed. Before any stateful output, an interruption without a checkpoint can still rebase from OpenCode history. Stateful interruptions without a checkpoint are surfaced because replay would be ambiguous; retry exhaustion remains explicit. A transport closure after `turn_ended` is treated as successful completion.
 - **Large reads are capped by OpenCode, and the cap is reported** — OpenCode 1.x `read` stops at `MAX_BYTES = 50 * 1024` and appends `(Output capped at 50 KB. Showing lines X-Y. Use offset=N to continue.)`. OpenCode 2 prints `Read file <path>, lines <start>-<end>` with `N: ` prefixes and, when the page ends before EOF, `[Output truncated. Continue reading with offset: N]` (50 KB or 2,000 lines); it also shortens each individual line after 2,000 characters. The provider strips either envelope before returning content to Cursor so the model cannot echo wrappers into a later write, but it re-states every partial result: a native read appends a `[Partial read: …]` marker after the content, an MCP read gets a separate notice content item, and a Pi read carries structured `PiReadExecSuccess.truncation`. Relative grep, glob, and directory entries are resolved against the workspace root. Shell stdout absolutizes only relative path tokens, not prose. Checkpointed turns, which do not resend the system prompt, get that same root on the user message. The structured `truncated` flag alone is not enough — verified against live `gpt-5.4-mini` and `grok-4.5` sessions, both of which asserted "highly confident" that partial content was the whole file until the textual marker was added. Deliberately paged reads (explicit `offset`/`limit`) are not marked unless the host also hits the byte cap or character-truncates a line. Whole-file writes and overwriting `Add File` patches that echo the marker are rejected before OpenCode executes them; targeted edits remain possible, including edits to source that quotes the warning text. Cursor's private legacy-edit read is handled separately as described above, so an edit can operate on a workspace file larger than 50 KB without turning the capped preview into a replacement. The cap is hardcoded in OpenCode's read tool — it is not the configurable `tool_output.max_bytes`, which governs `Truncate.Service` and not read's line accumulation — so ordinary model reads still require paging with `offset`.
 - **No fallback models** — if Cursor’s `AvailableModels` API is unreachable and there is no local cache, the provider exposes no models.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for user-facing release notes. New work lands under `[Unreleased]` until the next version tag.
 
 ## License
 

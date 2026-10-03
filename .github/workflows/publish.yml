@@ -24,13 +24,17 @@
 #     same session. Map any new Cursor display names, update the coverage
 #     fixture, and commit those files FIRST. This workflow is a backstop;
 #     failing here after the tag exists means a forced retag (see v0.6.4).
-#   - Bump "version" in package.json, commit to main.
+#   - Finalize CHANGELOG.md in the same release commit as the version bump:
+#     rename ## [Unreleased] → ## [X.Y.Z] - YYYY-MM-DD (UTC), then insert a
+#     fresh empty ## [Unreleased]. Do not tag with a stale Unreleased section.
+#   - Bump "version" in package.json, commit to main (include changelog).
 #   - Push a tag matching the version (e.g. git tag v0.1.2 && git push --tags).
 #   - This workflow runs install → refresh Cursor pricing → coverage check →
 #     typecheck → test → build → npm publish (OIDC).
 #   - Pricing is regenerated from https://cursor.com/docs/models-and-pricing.md
 #     in CI so the published dist/ snapshot matches current docs. The refreshed
 #     src/pricing-data.ts is used for that release build only (not committed).
+#   - Changelog finalization is agent/human-gated (no CI enforcement here).
 #
 # If OIDC publish fails with ENEEDAUTH, check that the workflow filename
 # (publish.yml), repository (oakimov/cursor-opencode-provider), and the
