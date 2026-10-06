@@ -1,6 +1,8 @@
 import { beforeEach, describe, it, expect } from "bun:test"
 import {
   computeAllowTools,
+  groundEphemeralSystemPromptTurn,
+  isEphemeralSystemPromptTurn,
   MAX_TURN_STATE_SESSIONS,
   resetTurnStateForTests,
   restoreTurnToolCatalog,
@@ -28,6 +30,59 @@ describe("computeAllowTools", () => {
     expect(computeAllowTools(1, undefined)).toBe(true)
     expect(computeAllowTools(2, { type: "auto" })).toBe(true)
     expect(computeAllowTools(1, { type: "required" })).toBe(true)
+  })
+})
+
+describe("isEphemeralSystemPromptTurn", () => {
+  it("isolates title and generate runs that advertise no tools", () => {
+    expect(isEphemeralSystemPromptTurn({
+      incomingToolCount: 0,
+      isCompaction: false,
+      recovering: false,
+    })).toBe(true)
+  })
+
+  it("keeps compaction and recovery on the shared conversation catalog", () => {
+    expect(isEphemeralSystemPromptTurn({
+      incomingToolCount: 0,
+      isCompaction: true,
+      recovering: false,
+    })).toBe(false)
+    expect(isEphemeralSystemPromptTurn({
+      incomingToolCount: 0,
+      isCompaction: false,
+      recovering: true,
+    })).toBe(false)
+  })
+
+  it("does not isolate a normal tool-using turn", () => {
+    expect(isEphemeralSystemPromptTurn({
+      incomingToolCount: 4,
+      toolChoice: { type: "auto" },
+      isCompaction: false,
+      recovering: false,
+    })).toBe(false)
+  })
+})
+
+describe("groundEphemeralSystemPromptTurn", () => {
+  it("puts the host system prompt ahead of the question", () => {
+    expect(groundEphemeralSystemPromptTurn(
+      "You are a title generator. Output ONLY a thread title.",
+      "What is this repo?",
+    )).toBe(
+      "You are a title generator. Output ONLY a thread title.\n\nWhat is this repo?",
+    )
+  })
+
+  it("keeps the user text when the host sent no system prompt", () => {
+    expect(groundEphemeralSystemPromptTurn(undefined, "What is this repo?")).toBe("What is this repo?")
+    expect(groundEphemeralSystemPromptTurn("  ", "What is this repo?")).toBe("What is this repo?")
+  })
+
+  it("does not repeat a user message that is already the system prompt", () => {
+    expect(groundEphemeralSystemPromptTurn("Name this session.", "Name this session.")).toBe("Name this session.")
+    expect(groundEphemeralSystemPromptTurn("Name this session.", "")).toBe("Name this session.")
   })
 })
 
@@ -60,9 +115,10 @@ describe("compaction tool catalog", () => {
     })).toEqual({ advertisedTools: [], allowTools: false })
   })
 
-  it("keeps the catalog advertised on every lifecycle turn, not just compaction", async () => {
-    // Collapsing a title-generation turn to tools=0 changes the RequestContext
-    // shape and costs the whole prompt cache; execution stays refused instead.
+  it("keeps the catalog advertised on shared-conversation zero-tool turns", async () => {
+    // Compaction shares the reminted conversation with the next agent turn.
+    // Collapsing that turn to tools=0 changes RequestContext and costs the
+    // prompt cache. Ephemeral title/generate runs do not use this path.
     const tools = [{ name: "read", inputSchema: { type: "object" } }]
     restoreTurnToolCatalog("ses_restored_catalog", tools)
 

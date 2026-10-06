@@ -249,14 +249,25 @@
 - **Soft-ack is not a tool-list change.** Rebuild `dist/` before live OpenCode
   tests; a stale build still hard-rejects while source soft-acks.
 
+## 2026-10-06 — Ephemeral title runs must not inherit the agent catalog
+
+- **Title/generate Runs are a throwaway conversation.** They do not share
+  RequestContext with the agent turn, so waiting for the sibling catalog does
+  not protect the prompt cache. It appends interaction guidance and workspace
+  rules on top of OpenCode's system prompt, and Cursor answers the user
+  message. OpenCode keeps the first 100 characters of that answer as the
+  session title.
+- **Send the host system prompt alone.** No tools, no interaction guidance, no
+  AGENTS.md/rules. Compaction still re-advertises the catalog and still waits
+  on cold start, because that conversation id is reused by the next turn.
+- **The rule is not the task.** Cursor follows the live user message when it
+  conflicts with that rule. A title run whose user message is the question
+  ("What is this repo?") still answers, and OpenCode keeps the first 100
+  characters. Repeat the host system prompt in the user message.
+
 ## 2026-08-16 — Cold-start zero-tool Runs must wait for the sibling catalog
 
-- **Never freeze `tools=0` into RequestContext when a real catalog is about to
-  arrive.** Title/lifecycle Opens often race ahead of the agent Run. Advertising
-  empty then the full set changes RequestContext bytes and colds the prompt
-  cache (`continuity=cold`, divergent hashes). A timeout is not a fix — the live
-  race exceeded 1.6 seconds. A session-keyed lifecycle Run must wait for a sibling
-  `rememberToolCatalog`; cancellation is the only escape, never `tools=[]`.
+- **Never freeze `tools=0` into a shared conversation's RequestContext when a real catalog is about to arrive.** Compaction often races ahead of the agent Run. Advertising empty then the full set changes RequestContext bytes and colds the prompt cache (`continuity=cold`, divergent hashes). A timeout is not a fix — the live race exceeded 1.6 seconds. A session-keyed compaction Run must wait for a sibling `rememberToolCatalog`; cancellation is the only escape, never `tools=[]`. Title/generate Runs are not this case: see 2026-10-06.
 - **Do not invent or filter enabled tools.** Advertisement stays the host's full
   set (or the last remembered one); permission (`allowTools`) stays false on
   zero-tool turns. Soft-ack alone does not fix the cache break.

@@ -30,6 +30,12 @@ export type BuildRequestContextInput = {
   mergedConfig?: OpencodeJson
   /** Host system context to deliver as the frozen system-instructions rule. */
   systemInstructions?: SystemInstructions
+  /**
+   * Ephemeral title/generate Runs. Carry no tools, skills, subagents, or
+   * workspace rules. The host system prompt is applied separately as the
+   * system-instructions rule (`systemInstructions`).
+   */
+  systemPromptOnly?: boolean
 }
 
 /**
@@ -148,6 +154,48 @@ function stripHostDuplicatedRequestContextFields(context: Record<string, unknown
 }
 
 /**
+ * RequestContext for an ephemeral title/generate Run.
+ *
+ * Tools, skills, subagents, and workspace rules are instructions. Including
+ * them makes Cursor answer the conversation. Completeness flags stay true so
+ * the server does not fill the gaps with its own discovery. Callers apply the
+ * host system prompt with `withSystemInstructions`; it is the only rule.
+ */
+export function buildSystemPromptOnlyRequestContext(workspaceRoot: string): Record<string, unknown> {
+  const root = path.resolve(workspaceRoot || process.cwd())
+  return {
+    env: buildEnv(root),
+    rules: [],
+    repository_info: [],
+    git_repos: [],
+    project_layouts: [],
+    rules_info_complete: true,
+    env_info_complete: true,
+    repository_info_complete: true,
+    git_repo_info_complete: true,
+    git_status_info_complete: true,
+    tools: [],
+    agent_skills: [],
+    custom_subagents: [],
+    mcp_file_system_options: {
+      enabled: false,
+      workspace_project_dir: root,
+      mcp_descriptors: [],
+    },
+    mcp_meta_tool_options: {
+      enabled: false,
+      mcp_descriptors: [],
+    },
+    web_search_enabled: false,
+    web_fetch_enabled: false,
+    agent_skills_info_complete: true,
+    custom_subagents_info_complete: true,
+    mcp_file_system_info_complete: true,
+    mcp_info_complete: true,
+  }
+}
+
+/**
  * Full RequestContext payload for live UMA + exec #10 reply.
  * Workspace env/git/layout, the host system-instructions rule, and
  * host-advertised tools and subagents. The provider never looks in Cursor's
@@ -156,6 +204,12 @@ function stripHostDuplicatedRequestContextFields(context: Record<string, unknown
 export async function buildRequestContext(
   input: BuildRequestContextInput,
 ): Promise<Record<string, unknown>> {
+  if (input.systemPromptOnly) {
+    return withSystemInstructions(
+      buildSystemPromptOnlyRequestContext(input.workspaceRoot),
+      input.systemInstructions,
+    )
+  }
   const workspaceRoot = path.resolve(input.workspaceRoot || process.cwd())
   const config = input.mergedConfig ?? await loadMergedConfig(workspaceRoot)
   const [dynamic, git, layout] = await Promise.all([

@@ -1,6 +1,7 @@
 import {
   buildDynamicRequestContext,
   buildRequestContext,
+  buildSystemPromptOnlyRequestContext,
   materializeRequestContext,
   requestContextBase,
   withSystemInstructions,
@@ -184,6 +185,16 @@ export async function getOrBuildRequestContext(
   opts?: { refresh?: boolean },
 ): Promise<{ context: Record<string, unknown>; reused: boolean }> {
   const scoped = conversationId ? { ...input, conversationId } : input
+  if (input.systemPromptOnly) {
+    // Throwaway conversation. Do not freeze this instruction set onto an id a
+    // later agent turn might reuse. The host system prompt still goes out as
+    // the system-instructions rule; tools and workspace rules do not.
+    const context = withSystemInstructions(
+      buildSystemPromptOnlyRequestContext(input.workspaceRoot),
+      input.systemInstructions,
+    )
+    return { context: freezeSnapshot(structuredClone(context)), reused: false }
+  }
   if (opts?.refresh && conversationId) clearOverlayHold(conversationId)
   if (!opts?.refresh && conversationId) {
     let base = getFrozenRequestContext(conversationId)

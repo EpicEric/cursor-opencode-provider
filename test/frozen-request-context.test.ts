@@ -440,6 +440,26 @@ describe("frozen request_context", () => {
       expect(filled.context.rules).toEqual([rule("live text")])
     })
 
+    it("sends only the host system prompt on a throwaway title turn", async () => {
+      const conversationId = "conv-system-prompt-only"
+      await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemInstructions: { text: "agent baseline", authoritative: true },
+      })
+      const ephemeral = await getOrBuildRequestContext(conversationId, {
+        workspaceRoot: root,
+        systemPromptOnly: true,
+        systemInstructions: { text: "title prompt", authoritative: true },
+        tools: [{ name: "bash", description: "shell", inputSchema: { type: "object" } }],
+      })
+      expect(ephemeral.reused).toBe(false)
+      expect(ephemeral.context.rules).toEqual([rule("title prompt")])
+      expect(ephemeral.context.tools).toEqual([])
+      expect(ephemeral.context.custom_subagents).toEqual([])
+      const again = await getOrBuildRequestContext(conversationId, { workspaceRoot: root })
+      expect(again.context.rules).toEqual([rule("agent baseline")])
+    })
+
     it("survives a durable restart byte-identically", async () => {
       const sessionKey = "ses-system-rule-restart"
       const conversationId = bindConversationId(sessionKey).conversationId

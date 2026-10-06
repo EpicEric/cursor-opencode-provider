@@ -490,11 +490,13 @@ export function connectFrameError(payload: string): CursorProviderError {
 }
 
 /**
- * Cold-start race: OpenCode's title/lifecycle Run often arrives with tools=[]
- * before the real agent Run publishes the catalog. Materializing RequestContext
- * with tools=0 and later with the full set changes its bytes, forces a prompt-
- * cache rebuild, and incurs avoidable cost. A valid session-keyed lifecycle Run
- * therefore waits for the first real catalog; cancellation is the only escape.
+ * Cold-start race for a shared conversation: a compaction Run often arrives
+ * with tools=[] before the real agent Run publishes the catalog. Materializing
+ * RequestContext with tools=0 and later with the full set changes its bytes,
+ * forces a prompt-cache rebuild, and incurs avoidable cost. A session-keyed
+ * compaction Run therefore waits for the first real catalog; cancellation is
+ * the only escape. Ephemeral title/generate Runs do not share that
+ * conversation and must not wait or advertise the catalog.
  */
 type ToolCatalogWaiter = {
   resolve: (tools: OpencodeToolDef[]) => void
@@ -1163,13 +1165,29 @@ async function startSession(
   const isCompaction = compactionOption === true || (
     compactionOption === undefined && isCompactionSession(sessionKey)
   )
-  const toolState = await resolveTurnToolState({
-    sessionKey,
-    incomingTools,
+  const recovery = startOptions?.recovery
+  // Title/generate Runs are ephemeral and exist only to follow OpenCode's
+  // system prompt. Waiting for the sibling catalog and advertising it appends
+  // interaction guidance plus workspace rules, and Cursor then answers the
+  // conversation instead of emitting a title.
+  const isolateSystemPrompt = isEphemeralSystemPromptTurn({
+    incomingToolCount: incomingTools.length,
     toolChoice: callOptions.toolChoice,
     isCompaction,
-    abortSignal: callOptions.abortSignal,
+    recovering: !!recovery,
   })
+  if (isolateSystemPrompt) {
+    trace("ephemeral system-prompt turn: omitting tools, guidance, and workspace rules")
+  }
+  const toolState = isolateSystemPrompt
+    ? { advertisedTools: [] as OpencodeToolDef[], allowTools: false }
+    : await resolveTurnToolState({
+        sessionKey,
+        incomingTools,
+        toolChoice: callOptions.toolChoice,
+        isCompaction,
+        abortSignal: callOptions.abortSignal,
+      })
   const tools = toolState.advertisedTools
   const webToolAliases = buildCustomWebToolAliases(tools)
   const cursorTools = webToolAliases.advertisedTools
@@ -1181,7 +1199,6 @@ async function startSession(
   }
   const allowTools = toolState.allowTools
   const discoveredSubagentCatalog = extractHostSubagentCatalog(cursorTools)
-  let recovery = startOptions?.recovery
   let resumeRecovery = recovery?.kind === "resume" ? recovery : undefined
   let resuming = !!resumeRecovery
   const lifecycle = !allowTools && !isCompaction && !recovery
@@ -1309,22 +1326,34 @@ async function startSession(
   ].filter((part): part is string => !!part)
 
   // `systemPrompt` is the host system context composed for a seed Run (kept for
-  // diagnostics and size estimates). It reaches Cursor only as the frozen
+  // diagnostics and size estimates). It reaches Cursor as the frozen
   // system-instructions rule in RequestContext, never as a seeded `system`
-  // message, which Cursor does not follow.
+  // message, which Cursor does not follow. Title/generate also repeat it in
+  // the live user message: the rule loses when the user message is the question.
   let systemPrompt: string | undefined
   let systemInstructions: SystemInstructions | undefined
   if (isCompaction || lifecycle) {
     // Ephemeral summary/title Runs — do not initialize a sticky Context Epoch.
-    systemPrompt = startedWithCheckpoint
-      ? undefined
+    // Title/generate must send OpenCode's system prompt alone. Interaction
+    // guidance tells the model to answer and call tools, which is what turns
+    // a title request into a truncated answer.
+    const seeded = lifecycle
+      ? baseSystemPrompt
       : [baseSystemPrompt, interactionGuidance, ...oneShotReminders].filter(Boolean).join("\n\n")
+    systemPrompt = startedWithCheckpoint ? undefined : (seeded || undefined)
     if (startedWithCheckpoint && oneShotReminders.length) {
       userText = appendMidConversationMessage(userText, oneShotReminders.join("\n\n"))
     }
     const ephemeralText = systemPrompt
       ?? [baseSystemPrompt, interactionGuidance].filter(Boolean).join("\n\n")
     if (ephemeralText) systemInstructions = { text: ephemeralText, authoritative: true }
+    // The rule is not the task. Cursor answers a user message that is the
+    // question ("What is this repo?") and OpenCode keeps the first 100
+    // characters of that answer as the session title. The host prompt has to
+    // be the live user message or the title agent never runs.
+    if (lifecycle && systemPrompt) {
+      userText = groundEphemeralSystemPromptTurn(systemPrompt, userText === "." ? "" : userText)
+    }
   } else {
     const admitted = admitContextEpoch({
       conversationId,
@@ -1457,7 +1486,7 @@ async function startSession(
   // Run mutates volatile slices (git porcelain, layout) and breaks prompt cache.
   const { context: requestContext, reused: requestContextReused } = await getOrBuildRequestContext(
     conversationId,
-    { workspaceRoot, tools: cursorTools, mergedConfig, systemInstructions },
+    { workspaceRoot, tools: cursorTools, mergedConfig, systemInstructions, systemPromptOnly: lifecycle },
   )
   // Skills live in the host system prompt and `skill` tool. Do not scan disk or
   // emit RequestContext `agent_skills` Mid-Conversation XML; host `<system-update>`
@@ -4762,6 +4791,36 @@ export function computeAllowTools(
   return toolCount > 0 && toolChoice?.type !== "none"
 }
 
+/**
+ * Title and generate Runs. They open a throwaway Cursor conversation, so they
+ * must carry OpenCode's system prompt without the sibling tool catalog,
+ * interaction guidance, or workspace rules. Compaction stays on the shared
+ * conversation and is not included.
+ */
+export function isEphemeralSystemPromptTurn(input: {
+  incomingToolCount: number
+  toolChoice?: LanguageModelV3CallOptions["toolChoice"]
+  isCompaction: boolean
+  recovering: boolean
+}): boolean {
+  if (input.isCompaction || input.recovering) return false
+  return !computeAllowTools(input.incomingToolCount, input.toolChoice)
+}
+
+/**
+ * Cursor follows the live user message when it conflicts with a RequestContext
+ * rule. A title/generate rule that says not to answer loses to a user message
+ * that is the question, and OpenCode stores the truncated answer as the title.
+ * Repeat the host system prompt as the task, with the original text under it.
+ */
+export function groundEphemeralSystemPromptTurn(systemPrompt: string | undefined, userText: string): string {
+  const instruction = systemPrompt?.trim()
+  if (!instruction) return userText
+  const body = userText.trim()
+  if (!body || body === instruction) return instruction
+  return `${instruction}\n\n${userText}`
+}
+
 export async function resolveTurnToolState(input: {
   sessionKey?: string
   incomingTools: OpencodeToolDef[]
@@ -4781,17 +4840,21 @@ export async function resolveTurnToolState(input: {
   // the whole tools prefix. Prefer: keep the epoch's fullest catalog for
   // advertisement; compute allowTools from what actually arrived this turn.
   //
-  // A zero-tool call is never a smaller catalog — it is a lifecycle turn
-  // (compaction, title generation) that re-advertises the last real catalog.
+  // A zero-tool call on a shared conversation is never a smaller catalog —
+  // compaction re-advertises the last real catalog so the reminted
+  // conversation matches the next turn. Ephemeral title/generate Runs do not
+  // call this path; startSession isolates them so Cursor follows OpenCode's
+  // system prompt instead of the coding-agent catalog.
   // New tool names (MCP connect) append at the tail without rewriting
   // descriptors already frozen. Equal name-sets and host shrinks keep the
   // frozen advertisement and its order — schema/description churn must not
   // retokenize tools, and inserting a name that sorts earlier than `z` must
   // not reshuffle the prefix.
   //
-  // On cold start the lifecycle Run may arrive before any catalog exists. For a
+  // On cold start a compaction Run may arrive before any catalog exists. For a
   // valid session key, wait until a sibling doStream publishes the first real
-  // catalog; cancellation is the only escape.
+  // catalog; cancellation is the only escape. Title/generate Runs are not
+  // compaction and do not wait here.
   let advertisedTools: OpencodeToolDef[]
   if (incomingTools.length > 0) {
     if (sessionKey) {

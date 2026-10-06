@@ -3,7 +3,11 @@ import { mkdir, writeFile, rm } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
 import { isProjectConfigDisabled, loadMergedConfig } from "../src/context/rules.js"
-import { buildRequestContext } from "../src/context/build.js"
+import {
+  SYSTEM_INSTRUCTIONS_RULE_PATH,
+  buildRequestContext,
+  buildSystemPromptOnlyRequestContext,
+} from "../src/context/build.js"
 import { workspaceRootFromRequestContext } from "../src/context/env.js"
 import { opencodeProjectDir } from "../src/context/paths.js"
 import { encodeMessage, decodeMessage } from "../src/protocol/messages.js"
@@ -42,6 +46,34 @@ describe("buildRequestContext", () => {
     else process.env.XDG_CONFIG_HOME = prevXdgConfig
     await rm(root, { recursive: true, force: true })
     await rm(isolatedHome, { recursive: true, force: true })
+  })
+
+  it("omits workspace instructions on a system-prompt-only turn", async () => {
+    const bare = buildSystemPromptOnlyRequestContext(root)
+    expect(bare.rules).toEqual([])
+    expect(bare.tools).toEqual([])
+    expect(bare.agent_skills).toEqual([])
+    expect(bare.custom_subagents).toEqual([])
+    expect(bare.rules_info_complete).toBe(true)
+    expect((bare.mcp_file_system_options as { enabled: boolean }).enabled).toBe(false)
+
+    const ctx = await buildRequestContext({
+      workspaceRoot: root,
+      systemPromptOnly: true,
+      systemInstructions: { text: "Name this session.", authoritative: true },
+      tools: [{ name: "bash", description: "Run a command", inputSchema: { type: "object" } }],
+    })
+    expect(ctx.rules).toEqual([{
+      full_path: SYSTEM_INSTRUCTIONS_RULE_PATH,
+      content: "Name this session.",
+      type: { global: {} },
+    }])
+    expect(ctx.tools).toEqual([])
+    expect(ctx.agent_skills).toEqual([])
+    expect(ctx.custom_subagents).toEqual([])
+    expect(ctx.mcp_meta_tool_options).toEqual({ enabled: false, mcp_descriptors: [] })
+    expect(JSON.stringify(ctx)).not.toContain("Run a command")
+    expect(encodeMessage("RequestContext", ctx).length).toBeGreaterThan(0)
   })
 
   it("does not invent custom subagents when the host schema has no catalog", async () => {

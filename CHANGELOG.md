@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Session titles stay a short name. Title and generate runs send only OpenCode's system prompt, without the agent tool catalog or workspace instructions, and that prompt is also the live user message. A rule alone loses to the question, so Cursor was answering and OpenCode kept the first 100 characters.
+
 ## [0.8.0] - 2026-10-04
 
 ### Changed
